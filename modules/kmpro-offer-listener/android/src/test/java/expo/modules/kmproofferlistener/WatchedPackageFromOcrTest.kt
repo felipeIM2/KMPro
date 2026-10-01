@@ -1,0 +1,106 @@
+package expo.modules.kmproofferlistener
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Test
+
+/**
+ * Regression tests for the app identity inferred from OCR output.
+ *
+ * The lines below are verbatim ML Kit output captured from a real 99 driver
+ * screen via AccessibilityService.takeScreenshot() on a Samsung Tab S9 FE. The
+ * brand glyph in the header is the trap: ML Kit reads the 99 logo as "9l$90" or
+ * "9l90", so matching the clean word "99pop" never fires and every real screen
+ * was classified as unknown, which made the whole OCR path return early.
+ */
+class WatchedPackageFromOcrTest {
+  /** 99 home screen, offline. The header logo OCRs as "9l$90". */
+  private val home99 = listOf(
+    "22:45 qua., 30 de set. → 99",
+    "Você está offline",
+    "Tudo pronto?",
+    "Santa Leopoldina",
+    "Cariacica",
+    "Programar lembretes",
+    "Missão",
+    "Serra",
+    "Página inicial",
+    "Conclua 40 viagens e ganhe R$ 44 a mais",
+    "1a 1-3 min",
+    "Descubra",
+    "+R$ 13",
+    "Aeroporto Eurico",
+    "Ficar online",
+    "Ganhos",
+    "Caixa de entrada",
+    "99",
+    "Menu",
+    "9l$90",
+  )
+
+  /** 99 screen with the logo read as "9l90" instead of "9l$90". */
+  private val home99Alt = listOf(
+    "22:45 qua., 30 de set. >u 99",
+    "1-3 min",
+    "R$ 0,00",
+    "Você está online",
+    "Procurando viagens",
+    "Ganhos",
+    "9l90",
+  )
+
+  /** Uber driver home screen, real OCR output. */
+  private val homeUber = listOf(
+    "Cariacica",
+    "Nova Vila Velha",
+    "Tudo pronto?",
+    "Você está online",
+    "Aceitar",
+  )
+
+  @Test
+  fun `99 home screen is recognised despite the garbled logo`() {
+    assertEquals(
+      "com.app99.driver",
+      WatchedApp.fromOcrLines(home99),
+    )
+  }
+
+  @Test
+  fun `99 logo read as 9l90 is still recognised`() {
+    assertEquals(
+      "com.app99.driver",
+      WatchedApp.fromOcrLines(home99Alt),
+    )
+  }
+
+  @Test
+  fun `uber home screen is recognised`() {
+    assertEquals(
+      "com.ubercab.driver",
+      WatchedApp.fromOcrLines(homeUber),
+    )
+  }
+
+  @Test
+  fun `uber home screen survives a lost accent`() {
+    // ML Kit drops the cedilla/tilde on small text: "voce esta online".
+    assertEquals(
+      "com.ubercab.driver",
+      WatchedApp.fromOcrLines(listOf("voce esta online", "Tudo pronto?")),
+    )
+  }
+
+  @Test
+  fun `an unrelated screen yields no package`() {
+    assertNull(WatchedApp.fromOcrLines(listOf("Calculadora", "7 x 8 =", "56")))
+  }
+
+  @Test
+  fun `a bare launcher screen yields no package`() {
+    // The "Gigu" text can appear in the recents list without any ride app open.
+    assertNull(
+      WatchedApp.fromOcrLines(listOf("Gigu", "99", "Calculadora")),
+    )
+  }
+}

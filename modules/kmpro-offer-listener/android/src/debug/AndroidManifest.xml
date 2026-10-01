@@ -1,0 +1,18 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+  <!--
+    Somente para conferir o layout do cartão sem esperar uma corrida real.
+    Fica em src/debug para não entrar na variante release, já que o receiver
+    precisa ser exported=true para receber o broadcast do adb.
+  -->
+  <application>
+    <receiver
+      android:name="expo.modules.kmproofferlistener.OverlayDebugReceiver"
+      android:exported="true">
+      <intent-filter>
+        <action android:name="co.anonymous.KMPro.DEBUG_SHOW_OVERLAY" />
+        <action android:name="co.anonymous.KMPro.DEBUG_HIDE_OVERLAY" />
+      </intent-filter>
+    </receiver>
+  </application>
+</manifest>

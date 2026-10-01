@@ -1,65 +1,62 @@
-import { SymbolView } from 'expo-symbols';
-import { PropsWithChildren, useState } from 'react';
-import { Pressable, StyleSheet } from 'react-native';
+import * as React from 'react';
 import Animated, { FadeIn } from 'react-native-reanimated';
+import { Pressable, Text, View, type ViewProps } from 'react-native';
+import { ChevronDown } from 'lucide-react-native';
 
-import { ThemedText } from '@/components/themed-text';
-import { ThemedView } from '@/components/themed-view';
-import { Spacing } from '@/constants/theme';
-import { useTheme } from '@/hooks/use-theme';
+type CollapsibleProps = ViewProps & {
+  open: boolean;
+  children: React.ReactNode;
+  className?: string;
+};
 
-export function Collapsible({ children, title }: PropsWithChildren & { title: string }) {
-  const [isOpen, setIsOpen] = useState(false);
-  const theme = useTheme();
-
+export function Collapsible({ open, children, className, ...props }: CollapsibleProps) {
+  if (!open) return null;
   return (
-    <ThemedView>
-      <Pressable
-        style={({ pressed }) => [styles.heading, pressed && styles.pressedHeading]}
-        onPress={() => setIsOpen((value) => !value)}>
-        <ThemedView type="backgroundElement" style={styles.button}>
-          <SymbolView
-            name={{ ios: 'chevron.right', android: 'chevron_right', web: 'chevron_right' }}
-            size={14}
-            weight="bold"
-            tintColor={theme.text}
-            style={{ transform: [{ rotate: isOpen ? '-90deg' : '90deg' }] }}
-          />
-        </ThemedView>
-
-        <ThemedText type="small">{title}</ThemedText>
-      </Pressable>
-      {isOpen && (
-        <Animated.View entering={FadeIn.duration(200)}>
-          <ThemedView type="backgroundElement" style={styles.content}>
-            {children}
-          </ThemedView>
-        </Animated.View>
-      )}
-    </ThemedView>
+    <Animated.View
+      entering={FadeIn.duration(160)}
+      className={className}
+      {...props}
+    >
+      {children}
+    </Animated.View>
   );
 }
 
-const styles = StyleSheet.create({
-  heading: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Spacing.two,
-  },
-  pressedHeading: {
-    opacity: 0.7,
-  },
-  button: {
-    width: Spacing.four,
-    height: Spacing.four,
-    borderRadius: 12,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  content: {
-    marginTop: Spacing.three,
-    borderRadius: Spacing.three,
-    marginLeft: Spacing.four,
-    padding: Spacing.four,
-  },
-});
+type CollapsibleRowProps = {
+  icon?: React.ReactNode;
+  title: string;
+  open: boolean;
+  onPress: () => void;
+  right?: React.ReactNode;
+};
+
+export function CollapsibleRow({
+  icon,
+  title,
+  open,
+  onPress,
+  right,
+}: CollapsibleRowProps) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityState={{ expanded: open }}
+      onPress={onPress}
+      className="flex-row items-center gap-3 p-4 active:opacity-70"
+    >
+      {icon}
+      <View className="flex-1 gap-0.5">
+        <Text className="text-base font-semibold text-foreground">{title}</Text>
+        <Text className="text-xs text-muted-foreground">
+          {open ? 'Toque para recolher' : 'Toque para configurar'}
+        </Text>
+      </View>
+      {right}
+      <ChevronDown
+        size={18}
+        color="#a3a3a3"
+        style={open ? { transform: [{ rotate: '180deg' }] } : undefined}
+      />
+    </Pressable>
+  );
+}

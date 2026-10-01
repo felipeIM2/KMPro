@@ -9,8 +9,14 @@ dist/
 web-build/
 expo-env.d.ts
 
+# kmpro-spy capture sessions (video, timeline, logcat)
+spy-out/
+scripts/.kmpro-spy-sampler.sh
+
 # Native
 .kotlin/
+**/.gradle/
+**/build/
 *.orig.*
 *.jks
 *.p8

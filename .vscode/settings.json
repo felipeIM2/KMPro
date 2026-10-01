@@ -1,4 +1,6 @@
 {
+  "gradle.nestedProjects": false,
+  "gradle.autoDetect": "off",
   "editor.codeActionsOnSave": {
     "source.fixAll": "explicit",
     "source.organizeImports": "explicit",

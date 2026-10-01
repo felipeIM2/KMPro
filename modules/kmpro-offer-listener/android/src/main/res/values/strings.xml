@@ -1,0 +1,7 @@
+<resources>
+  <string name="kmpro_listener_name">KMPro — leitura de ofertas</string>
+  <string name="kmpro_accessibility_name">KMPro — controle do copiloto</string>
+  <string name="kmpro_accessibility_description">Detecta as telas de oferta dos apps de corrida para aceitar automaticamente corridas que atendam às suas metas e exibir o cartão de decisão.</string>
+  <string name="kmpro_fg_title">KMPro — Copiloto ativo</string>
+  <string name="kmpro_fg_text">Monitorando corridas da Uber e da 99.</string>
+</resources>
