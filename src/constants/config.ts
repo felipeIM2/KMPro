@@ -123,4 +123,13 @@ export function totalCostPerKm(settings: CostSettings = DEFAULT_COST_SETTINGS) {
   return fuelCostPerKm(settings) + fixedCostPerKm(settings);
 }
 
+/**
+ * Custo por hora no ritmo planejado (km/dia ÷ horas/dia). É o alvo do lucro/h
+ * e, escalado pela duração da oferta, do lucro por viagem.
+ */
+export function hourlyCost(settings: CostSettings = DEFAULT_COST_SETTINGS) {
+  const hours = settings.hoursPerDay || 1;
+  return totalCostPerKm(settings) * (settings.kmPerDay / hours);
+}
+
 export { WEEKS_PER_MONTH };

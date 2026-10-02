@@ -13,6 +13,8 @@ export type CardGoalsInput = {
   gainHourMin: number;
   gainHourMax: number;
   ratingMin: number;
+  /** Custo por hora (totalCostPerKm × km/h planejado); alvo do lucro/h. */
+  custoHora: number;
 };
 
 export function isListenerAvailable(): boolean {
@@ -95,7 +97,8 @@ export async function setCardGoals(goals: CardGoalsInput): Promise<void> {
       goals.gainKmMax,
       goals.gainHourMin,
       goals.gainHourMax,
-      goals.ratingMin
+      goals.ratingMin,
+      goals.custoHora
     );
 }
 

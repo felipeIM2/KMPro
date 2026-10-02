@@ -11,6 +11,7 @@ class CardGoalsTest {
     gainHourMin = 30.0,
     gainHourMax = 50.0,
     ratingMin = 4.85,
+    custoHora = 20.0,
   )
 
   @Test
@@ -57,5 +58,46 @@ class CardGoalsTest {
   fun `boundary of the minimum is green`() {
     // 1.5 com mínima em 1.5: não é menor que o mínimo e não tem max (rating).
     assertEquals(RideCalc.GREEN, goals.toneFor("rating", 4.85))
+  }
+
+  @Test
+  fun `lucro per hour uses the hourly cost as target`() {
+    // Alvo 20/h: verde em 20+, amarelo entre 18 e 20, vermelho abaixo de 18.
+    assertEquals(RideCalc.GREEN, goals.toneFor("lucroHora", 20.0))
+    assertEquals(RideCalc.GREEN, goals.toneFor("lucroHora", 25.0))
+    assertEquals(RideCalc.YELLOW, goals.toneFor("lucroHora", 19.0))
+    assertEquals(RideCalc.RED, goals.toneFor("lucroHora", 17.9))
+  }
+
+  @Test
+  fun `lucro per trip scales the hourly target by the offer duration`() {
+    // 30 min = meia hora: alvo 10, amarelo entre 9 e 10, vermelho abaixo de 9.
+    assertEquals(RideCalc.GREEN, goals.toneForLucro(10.0, 30.0))
+    assertEquals(RideCalc.YELLOW, goals.toneForLucro(9.5, 30.0))
+    assertEquals(RideCalc.RED, goals.toneForLucro(8.9, 30.0))
+    // 60 min = uma hora: alvo 20.
+    assertEquals(RideCalc.GREEN, goals.toneForLucro(20.0, 60.0))
+    assertEquals(RideCalc.YELLOW, goals.toneForLucro(19.0, 60.0))
+  }
+
+  @Test
+  fun `lucro without a duration or with no hourly cost is neutral`() {
+    assertNull(goals.toneForLucro(10.0, null))
+    assertNull(goals.toneForLucro(10.0, 0.0))
+    assertNull(CardGoals(custoHora = 0.0).toneForLucro(10.0, 30.0))
+  }
+
+  @Test
+  fun `worst tone keeps the most severe and ignores nulls`() {
+    assertEquals(
+      RideCalc.RED,
+      CardGoals.worst(listOf(RideCalc.GREEN, RideCalc.RED, RideCalc.YELLOW)),
+    )
+    assertEquals(
+      RideCalc.YELLOW,
+      CardGoals.worst(listOf(null, RideCalc.GREEN, RideCalc.YELLOW)),
+    )
+    assertEquals(RideCalc.GREEN, CardGoals.worst(listOf(null, RideCalc.GREEN)))
+    assertNull(CardGoals.worst(listOf(null, null)))
   }
 }

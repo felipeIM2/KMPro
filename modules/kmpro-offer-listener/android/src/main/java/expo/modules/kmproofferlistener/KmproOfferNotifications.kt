@@ -127,14 +127,12 @@ object KmproOfferNotifications {
       offer,
       OfferManager.cardAppearance(app).metricOrder,
     ).joinToString(" · ")
-    val pickup = offer["pickup"]?.toString()?.takeIf { it.isNotBlank() } ?: "Origem"
-    val dropoff = offer["dropoff"]?.toString()?.takeIf { it.isNotBlank() } ?: "Destino"
     val minutes = (offer["durationMinutes"] as? Number)?.toDouble()
     val rating = (offer["rating"] as? Number)?.toDouble()
 
     val text = buildString {
-      append("$fare — $pickup → $dropoff")
-      if (metrics.isNotBlank()) append("\n$metrics")
+      // A tarifa já vai no título; o texto fica com métricas e fatos.
+      if (metrics.isNotBlank()) append(metrics)
       val facts = listOfNotNull(
         minutes?.let { String.format(Locale.US, "%.0f min", it) },
         rating?.let { String.format(Locale.US, "★ %.1f", it).replace('.', ',') },

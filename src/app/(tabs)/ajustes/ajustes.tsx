@@ -34,8 +34,8 @@ import { Badge } from '@/components/ui/badge';
 import { formatBRL, formatInt, formatNumber } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import { setCardAppearance } from '../../../../modules/kmpro-offer-listener';
-import type { MetricTones } from '@/components/offer-card';
-import { totalCostPerKm } from '@/constants';
+import type { MetricTones, OfferCardTone } from '@/components/offer-card';
+import { hourlyCost, totalCostPerKm } from '@/constants';
 import { metricValue } from '@/lib/ride-metrics';
 
 /**
@@ -54,6 +54,13 @@ function toneForRange(
   if (min > 0 && max > 0) return 'warn';
   if (min > 0) return value >= min ? 'good' : 'bad';
   return value >= max ? 'good' : 'bad';
+}
+
+/** Pior tom entre os mostradores (bad > warn > good), como o cartão nativo. */
+function worstTone(tones: (OfferCardTone | undefined)[]): OfferCardTone {
+  if (tones.includes('bad')) return 'bad';
+  if (tones.includes('warn')) return 'warn';
+  return 'good';
 }
 
 function CardShell({
@@ -90,14 +97,17 @@ export default function Ajustes() {
     autoAccept,
     setAutoAccept,
     goals,
+    costSettings,
   } = useApp();
 
   const [open, setOpen] = React.useState(false);
+  const costPerKm = totalCostPerKm(costSettings);
+  const custoHora = hourlyCost(costSettings);
 
   // Faixas de cada métrica na prévia, com a mesma fórmula do cartão nativo.
   const previewTones: MetricTones = React.useMemo(() => {
-    const costPerKm = totalCostPerKm();
     const tones: MetricTones = {};
+    const lucroMax = custoHora * (MOCK_OFFER.minutes / 60);
     for (const id of metricOrder) {
       const value = metricValue(id, MOCK_OFFER, costPerKm);
       if (id === 'ganhoKm') {
@@ -106,12 +116,21 @@ export default function Ajustes() {
       } else if (id === 'ganhoHora') {
         const tone = toneForRange(value, goals.gainHour[0], goals.gainHour[1]);
         if (tone) tones.ganhoHora = tone;
+      } else if (id === 'lucroHora') {
+        const tone = toneForRange(value, custoHora * 0.9, custoHora);
+        if (tone) tones.lucroHora = tone;
+      } else if (id === 'lucro') {
+        const tone = toneForRange(value, lucroMax * 0.9, lucroMax);
+        if (tone) tones.lucro = tone;
       }
     }
     const ratingTone = toneForRange(MOCK_OFFER.rating ?? 0, goals.rating, 0);
     if (ratingTone) tones.rating = ratingTone;
     return tones;
-  }, [metricOrder, goals]);
+  }, [metricOrder, goals, costPerKm, custoHora]);
+
+  // A borda da prévia segue o pior mostrador (sem a nota), como no nativo.
+  const previewTone = worstTone(metricOrder.map((id) => previewTones[id]));
 
 // Keep the floating overlay in sync with this screen, so what the preview
 // shows here is exactly what appears over the ride app.
@@ -207,8 +226,9 @@ React.useEffect(() => {
                   <OfferCard
                     offer={MOCK_OFFER}
                     order={metricOrder}
-                    tone="good"
+                    tone={previewTone}
                     tones={previewTones}
+                    costPerKm={costPerKm}
                   />
                 </View>
               </View>

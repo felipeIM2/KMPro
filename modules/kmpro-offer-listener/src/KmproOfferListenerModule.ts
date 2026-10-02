@@ -32,7 +32,8 @@ declare class KmproOfferListenerModule extends NativeModule<KmproOfferListenerEv
     gainKmMax: number,
     gainHourMin: number,
     gainHourMax: number,
-    ratingMin: number
+    ratingMin: number,
+    custoHora: number
   ): Promise<void>;
   setOverlayEnabled(enabled: boolean): Promise<void>;
   setCopilotoActive(active: boolean): Promise<void>;

@@ -35,11 +35,15 @@ object OfferParser {
   )
 
   // R$ 18,50 | R$18.5 | R$ 1.248,00 | (+R$ 8,75 surge — excluded by sign)
+  // O trecho numérico é capturado inteiro (dígitos e separadores) e interpretado
+  // por [parseMoney]: assim "1.248" vira 1248 e não 1,248 — o separador de
+  // milhar com ponto era lido como decimal e uma tarifa de milhar entrava como
+  // R$ 1,25, dentro da faixa plausível.
   private val FEE_RE =
-    Regex("""R\$\s*([-+]?)\s*(\d{1,4}(?:[.,]\d{1,3})?)""", RegexOption.IGNORE_CASE)
+    Regex("""R\$\s*([-+]?)\s*(\d[\d.,]*)""", RegexOption.IGNORE_CASE)
   // A node that contains ONLY the fare: "R$ 18,50" (matches whole segment).
   private val FEE_EXACT_RE =
-    Regex("""R\$\s*([-+]?)\s*(\d{1,4}(?:[.,]\d{1,3})?)\s*""", RegexOption.IGNORE_CASE)
+    Regex("""R\$\s*([-+]?)\s*(\d[\d.,]*)\s*""", RegexOption.IGNORE_CASE)
   // 7,4 km | 22.5km | 4 km
   private val DISTANCE_RE =
     Regex("""\b(\d{1,3}(?:[.,]\d{1,2})?)\s*km\b""", RegexOption.IGNORE_CASE)
@@ -57,23 +61,6 @@ object OfferParser {
     """(?i)(?:[uú]ltimos?|[uú]ltimas?|[uú]ltima|cerca de|m[eé]di[ao]s?|base|média|media)\s*""" +
       """(?:de\s*)?\d{1,3}\s*(?:min|mins|minutos|minuto)""",
   )
-  // Street-like anchor for pickup/destination (best effort):
-  /**
-   * Logradouro + bairro + cidade. A forma curta ("R.", "Av.", "Al.") precisa de
-   * lookahead para a fronteira depois do ponto, senão `\b` nunca casa e a regex
-   * ignora a linha inteira.
-   */
-  private val STREET_PREFIX =
-    """(?:\b(?:avenida|rua|estrada|alameda|travessa|rodovia|praça)|\b(?:av|ru|est|al|r)\.(?=\s)|br-?\d*)"""
-
-  private val STREET_RE =
-    Regex("""$STREET_PREFIX[^|]{2,70}""", RegexOption.IGNORE_CASE)
-
-  /** Logradouro no COMEÇO da parte ("Av. Talma…") — usado para separar a rua
-   *  do bairro quando a linha tem só dois blocos. */
-  private val STREET_AT_START_RE =
-    Regex("""^\s*$STREET_PREFIX""", RegexOption.IGNORE_CASE)
-
   /**
    * Nota do passageiro: aceita "4,9", "★ 4.9", "4.9 ★", "nota 4,9" e
    * "4,9 estrelas". O OCR costuma ler o ícone como `*`, `★` ou `A`.
@@ -91,18 +78,6 @@ object OfferParser {
       RegexOption.IGNORE_CASE,
     )
 
-  /** Só número e unidade, tipo "8,4 km" ou "R$ 21,90" — nunca um lugar. */
-  private val NUMERIC_ONLY_RE =
-    Regex("""^\+?\s*(?:r\$\s*)?\d[\d.,]*\s*(?:km|min|h)?\s*(?:de\s*)?(?:b[oô]nus)?$""",
-      RegexOption.IGNORE_CASE,
-    )
-
-  private val CLOCK_RE = Regex("""^\d{1,2}\s*[:h]\s*\d{2}""")
-
-  private val PLACEHOLDER_TOKENS = listOf(
-    "descubra", "ganhos", "menu", "ajuda", "perfil", "viagem", "promoções",
-  )
-
   /** Structured analysis produced for a text feed. */
   data class OfferAnalysis(
     val fare: Double? = null,
@@ -111,8 +86,6 @@ object OfferParser {
     val fareStr: String = "",
     val distanceStr: String = "",
     val durationStr: String = "",
-    val pickup: String = "",
-    val dropoff: String = "",
     val rating: Double? = null,
     val hasKeyword: Boolean = false,
     val allText: String = "",
@@ -130,6 +103,31 @@ object OfferParser {
   /** Parses Brazilian formatted numbers ("18,50" / "18.5") to Double, or null. */
   fun toDouble(raw: String): Double? =
     normalize(raw).replace(",", ".").toDoubleOrNull()
+
+  /**
+   * Interpreta um valor em reais com separador de milhar. O ponto só é decimal
+   * quando o número não tem vírgula E os grupos depois do ponto não têm 3
+   * dígitos: "18.5" -> 18,5 mas "1.248" -> 1248 e "1.248,00" -> 1248,00.
+   * Sem isso, "R$ 1.248" entrava como R$ 1,25 (dentro da faixa plausível) em vez
+   * de ser barrado pela faixa.
+   */
+  fun parseMoney(raw: String): Double? {
+    val trimmed = normalize(raw).trim().trimEnd('.', ',')
+    if (trimmed.isEmpty()) return null
+    val hasComma = trimmed.contains(',')
+    val hasDot = trimmed.contains('.')
+    val normalized = when {
+      hasComma && hasDot -> trimmed.replace(".", "").replace(",", ".")
+      hasComma -> trimmed.replace(",", ".")
+      hasDot -> {
+        val groups = trimmed.split('.')
+        val thousands = groups.size > 1 && groups.drop(1).all { it.length == 3 }
+        if (thousands) trimmed.replace(".", "") else trimmed
+      }
+      else -> trimmed
+    }
+    return normalized.toDoubleOrNull()
+  }
 
   private fun formatBrl(value: Double): String {
     val cents = Math.round(value * 100)
@@ -153,14 +151,14 @@ object OfferParser {
   fun parseFare(segments: List<String>): String? {
     val exact = segments.mapNotNull { s ->
       val m = FEE_EXACT_RE.matchEntire(normalize(s)) ?: return@mapNotNull null
-      if (m.groupValues[1] == "+") null else toDouble(m.groupValues[2])
+      if (m.groupValues[1] == "+") null else parseMoney(m.groupValues[2])
     }.filter { it > 0.0 }.maxOrNull()
     if (exact != null) return formatBrl(exact)
 
     // Fallback: scan the joined text but keep excluding "+R$" surge markers.
     val joined = segments.joinToString(" | ")
     val values = FEE_RE.findAll(joined).mapNotNull { m ->
-      if (m.groupValues[1] == "+") null else toDouble(m.groupValues[2])
+      if (m.groupValues[1] == "+") null else parseMoney(m.groupValues[2])
     }.filter { it > 0.0 }.toList()
     if (values.isEmpty()) return null
     return formatBrl(values.maxOrNull() ?: return null)
@@ -191,12 +189,16 @@ object OfferParser {
 
   /**
    * Soma as pernas da viagem quando o OCR traz as duas (coleta + destino).
-   * Retorna null se nenhuma perna for reconhecida, para o chamador cair no
-   * parse antigo por nó/texto.
+   * Retorna null quando menos de duas pernas completas são reconhecidas, para o
+   * chamador cair no parse antigo por nó/texto.
    */
   private fun summedLegs(segments: List<String>): Leg? {
     val legs = segments.mapNotNull { legFromNode(it) }
-    if (legs.isEmpty()) return null
+    // Só soma quando há DUAS pernas (coleta + viagem) de fato. Com uma perna
+    // isolada a soma não é diferente do parse por nó, e uma linha solta com
+    // "km + min" (ex.: o total lido de volta) tomava o lugar da distância/duração
+    // reais. Com <2, o chamador cai no parse antigo por nó/texto.
+    if (legs.size < 2) return null
     // Máximo de 2 pernas reais (coleta + destino). Se o OCR devolver mais
     // (ex.: leu o próprio card "15 min 5.7 km" como perna), ficam as duas de
     // menor km — a linha do card é sempre o total anterior, maior que as pernas.
@@ -292,92 +294,6 @@ object OfferParser {
     return null
   }
 
-  /**
-   * Origem e destino.
-   *
-   * O OCR entrega o card da Uber como linhas soltas ("Cariacica",
-   * "Nova Vila Velha"), sem seta, e os endereços completos às vezes trazem o
-   * bairro entre o logradouro e a cidade ("Rua X, Centro, Vitória"). Por isso:
-   * 1. usa as linhas de endereço quando existirem, na ordem em que aparecem;
-   * 2. senão usa os dois primeiros segmentos "de texto" que não são número,
-   *    keyword ou rótulo de UI.
-   */
-  private fun parseRoute(segments: List<String>): Pair<String, String> {
-    val joined = normalize(segments.joinToString(" | "))
-    val street = STREET_RE.findAll(joined).map { it.value.trim() }.toList()
-
-    val places = segments
-      .map { it.trim() }
-      .filter { it.isNotBlank() }
-      .filter { !isUiNoise(it) }
-      .filter { !NUMERIC_ONLY_RE.matches(it) }
-    // Lugares que não são o próprio endereço com logradouro já casado acima.
-    val otherPlaces = places.filterNot { p ->
-      street.any { it == p || p.startsWith(it) || it.startsWith(p) }
-    }
-
-    if (street.size >= 2) return withBairro(street[0]) to withBairro(street[1])
-    if (street.size == 1) {
-      // Ex.: "Av. Talma Rodrigues Ribeiro, Centro industrial" + "Cariacica".
-      return withBairro(street[0]) to (otherPlaces.firstOrNull() ?: "")
-    }
-
-    if (otherPlaces.size >= 2) return otherPlaces[0] to otherPlaces[1]
-    if (otherPlaces.size == 1) return otherPlaces[0] to ""
-    return "" to ""
-  }
-
-  /**
-   * Escolhe o que exibir no card a partir de um endereço separado por vírgulas.
-   * Regra combinada com o usuário:
-   *  - 3 ou mais partes: pega a do meio (o bairro);
-   *  - 2 partes: pega a que NÃO é logradouro — "Av. Talma…, Centro industrial"
-   *    mostra "Centro industrial" (a rua ia voltar de novo); "Cariacica, Serra"
-   *    mostra "Cariacica" (primeira, sem prefixo de rua);
-   *  - 1 parte (sem vírgula): mostra o que tiver.
-   * Partes que são só número são puladas, porque no formato
-   * "Rua X, 300, Bairro" a segunda parte é o número da casa, não o bairro.
-   */
-  private fun withBairro(address: String): String {
-    val parts = address.split(',').map { it.trim() }.filter { it.isNotBlank() }
-    if (parts.isEmpty()) return address.trim()
-    if (parts.size == 1) return parts[0]
-    if (parts.size == 2) {
-      val bairro = parts.firstOrNull { part -> !isNumberPart(part) && !STREET_AT_START_RE.containsMatchIn(part) }
-      return bairro ?: parts[0]
-    }
-    // 3+: começa no meio e pula partes puramente numéricas.
-    val meaningful = parts.drop(1).firstOrNull { !isNumberPart(it) }
-    return meaningful ?: parts[1]
-  }
-
-  /** "300", "1200", "45" — número de casa/rua, nunca um bairro. */
-  private fun isNumberPart(part: String): Boolean = part.matches(Regex("""\d+"""))
-
-  /** Linhas que nunca são um lugar: botões, rótulos de UI e horário. */
-  private val RATING_NODE_RE =
-    Regex("""^[★*A]?\s*\d{1,2}[.,]\d{1,2}\s*(?:\(\d+\))?\|?\s*$""")
-
-  private fun isUiNoise(line: String): Boolean {
-    val s = normalize(line)
-    if (s.isEmpty()) return true
-    if (s.length > 60) return true
-    if (CLOCK_RE.matches(s)) return true
-    if (PLACEHOLDER_TOKENS.any { s.equals(it, ignoreCase = true) }) return true
-    if (RATING_NODE_RE.matches(s)) return true
-    val l = s.lowercase()
-    // Botões e cabeçalhos de navegação da Uber/99 ("Aceitar"/"Selecionar" vêm
-    // capitalizados no OCR, então o filtro precisa ignorar caixa).
-    if (l.contains("aceitar") || l.contains("selecionar") || l.contains("voltar")) return true
-    if (l.contains("cancelar") || l.contains("recusar") || l.contains("confirmar")) return true
-    if (l.startsWith("r$") || l.endsWith("min") || l.endsWith("km")) return true
-    if (s.equals("destino", ignoreCase = true) || s.equals("origem", ignoreCase = true)) return true
-    if (l.startsWith("página inicial") || l.startsWith("menu")) return true
-    if (l.startsWith("caixa de entrada") || l.startsWith("ganhos")) return true
-    if (l.contains("ficar online") || l.contains("você está")) return true
-    return false
-  }
-
   fun platformForPackage(packageName: String): String = when (packageName) {
     "com.ubercab.driver" -> "uber"
     "com.app99.driver" -> "app99"
@@ -401,15 +317,24 @@ object OfferParser {
     val fareStr = parseFare(segments)
     val distanceStr = parseDistanceKm(segments)
     val durationStr = parseDuration(segments)
-    val (pickup, dropoff) = parseRoute(segments)
 
     // O card só pode aparecer quando a corrida "tocar": exigimos um valor, a
     // estrutura da oferta e um botão/ação de decisão. Sem a keyword de ação,
     // telas de Ganhos, Promoções e "Alta demanda" passariam como oferta só por
     // terem R$ e km.
     val hasAction = ACTION_KEYWORDS.any { lower.contains(it) }
+    val fareValue = fareStr?.let(::toDouble)
+    // Sanity band on the fare. OCR sometimes drops the decimal separator and
+    // "R$ 17,03" comes back as "R$ 1703" - the regex happily matches it (4
+    // digits) and the offer was accepted at a hundred times its real value. No
+    // single ride is worth over R$ 500, so anything above is a misread, not a
+    // fare. Below the floor it is the same story in reverse (cents read as
+    // reais).
+    val fareImplausible = fareValue != null &&
+      (fareValue < 0.5 || fareValue > 500.0)
     val rejectReason = when {
       fareStr == null -> "sem valor (R$) identificado"
+      fareImplausible -> "tarifa implausível (${fareStr} — separador decimal perdido?)"
       !hasKeyword -> "sem keyword de oferta"
       distanceStr == null -> "sem distância"
       durationStr == null -> "sem duração"
@@ -426,8 +351,6 @@ object OfferParser {
       fareStr = fareStr.orEmpty(),
       distanceStr = distanceStr.orEmpty(),
       durationStr = durationStr.orEmpty(),
-      pickup = pickup,
-      dropoff = dropoff,
       rating = rating,
       hasKeyword = hasKeyword,
       allText = joined,
@@ -500,8 +423,6 @@ object OfferParser {
       "fare" to analysis.fare,
       "distance" to analysis.distanceKm,
       "durationMinutes" to analysis.durationMinutes,
-      "pickup" to analysis.pickup,
-      "dropoff" to analysis.dropoff,
       "rating" to analysis.rating,
       "capturedAt" to capturedAt,
       "status" to "detected",
@@ -518,10 +439,30 @@ object OfferParser {
   }
 
   /** Signature used to deduplicate the same offer (fare + distance + duration). */
+  /**
+   * Identidade estável de uma oferta, para o dedup.
+   *
+   * A tarifa não pode entrar crua. Quando o app só expõe o valor por km
+   * ("R$ 1,37/km aprox."), a leitura é o produto dessa taxa pela distância — e o
+   * último centavo muda a cada varredura. Numa sessão real a MESMA oferta produziu
+   * 13.0, 13.01, 13.018, 13.021, 13.024 e 13.044287, e a comparação crua tratava
+   * cada uma como oferta nova: o cartão tremia e o Flutter recebia um
+   * ride_offer por leitura.
+   *
+   * Por isso a assinatura guarda a tarifa arredondada para 10 centavos e a
+   * distância para 100 metros: o mesmo valor por km continua colidindo (a
+   * variação observada foi de centavos), enquanto ofertas de verdade diferentes
+   * continuam distintas.
+   */
   fun offerSignature(offer: Map<String, Any?>): String {
-    val fare = offer["fare"]?.toString().orEmpty()
-    val distance = offer["distance"]?.toString().orEmpty()
-    val duration = offer["durationMinutes"]?.toString().orEmpty()
+    fun num(key: String): Double? {
+      val v = offer[key]
+      return (v as? Number)?.toDouble()
+        ?: v?.toString()?.trim()?.replace(',', '.')?.toDoubleOrNull()
+    }
+    val fare = num("fare")?.let { Math.round(it * 10.0) / 10.0 }
+    val distance = num("distance")?.let { Math.round(it * 100.0) / 100.0 }
+    val duration = num("durationMinutes")
     return "$fare|$distance|$duration"
   }
 }

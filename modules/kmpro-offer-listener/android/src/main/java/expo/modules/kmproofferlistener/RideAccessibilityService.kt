@@ -41,15 +41,46 @@ class RideAccessibilityService : AccessibilityService() {
   private val POLL_INTERVAL_MS = 750L
 
   private val handler = Handler(Looper.getMainLooper())
-  private var lastScanAt = 0L
   private var lastScreenSignature = ""
 
   /**
-   * Última assinatura de oferta POR PACOTE. Em tela dividida com Uber e 99
-   * oferecendo ao mesmo tempo, cada app precisa do seu próprio dedup: uma assinatura
-   * global faria as duas ofertas se alternarem como "novas" a cada varredura.
+   * Apps vigiados com janela visível na última varredura. Um pacote que some
+   * deste conjunto (app fechado/minimizado em tela dividida) teve a oferta
+   * encerrada — o cartão dele sai na hora, sem esperar o "Tempo de tela".
    */
-  private val lastOfferSignatureByPkg = mutableMapOf<String, String>()
+  private var lastSeenWatchedPkgs = setOf<String>()
+
+  /**
+   * Fim de qualquer varredura, inclusive as que voltaram cedo por dedup. É isso
+   * que a porta de eventos usa para saber que a árvore já foi lida.
+   */
+  private var lastScanDoneAt = 0L
+
+  /**
+   * Teto de varreduras dirigidas por EVENTO. Medido numa sessão real da 99: a
+   * Uber dispara WINDOW_CONTENT_CHANGED a 9,6/s e cada evento varrendo todas as
+   * janelas produzia 20,3 scans/s, suficiente para saturar o handler - o tick do
+   * POLL subia de 750 ms para 1107 ms de mediana e a cadência real de OCR ficava
+   * em 2083 ms, porque o cooldown de 1200 ms não fechava conta com o tick.
+   *
+   * Nada se perde ao segurar o evento: o painel de oferta não aparece na árvore
+   * de acessibilidade (no log da sessão medida, os CONTENT_CHANGED voltaram todos
+   * como "mesmo texto" e quem achou a oferta foi o OCR do POLL), e o próprio POLL
+   * já chama scanActiveWindow a cada tick. Descartar um evento que chegou logo
+   * depois de uma varredura completa só adia o work no máximo um tick.
+   */
+  private val EVENT_SCAN_MIN_GAP_MS = 400L
+
+  /**
+   * Ciclo de vida da corrida por pacote — ver [RideLifecycle]. Substitui o mapa
+   * de assinaturas que vivia aqui: ele guardava a última oferta por pacote e
+   * nunca era limpo quando a corrida saía da tela, então a mesma corrida que
+   * voltasse com valores idênticos era sempre descartada como repetida.
+   *
+   * Em tela dividida com Uber e 99 oferecendo ao mesmo tempo, cada app precisa
+   * do seu próprio dedup: uma assinatura global faria as duas ofertas se
+   * alternarem como "novas" a cada varredura.
+   */
 
   private val scanRunnable = Runnable { scanActiveWindow("CONTENT_DEBOUNCE") }
   private val scanFastRunnable = Runnable { scanActiveWindow("CONTENT_FAST") }
@@ -77,6 +108,10 @@ class RideAccessibilityService : AccessibilityService() {
   private var ocr: ScreenOcr? = null
 
   private fun captureByOcr(reason: String) {
+    if (!OfferManager.isCopilotoActive(this)) {
+      Log.d(TAG, "[KMPro][Ocr] copiloto pausado, captura ignorada reason=$reason")
+      return
+    }
     val now = System.currentTimeMillis()
     val interval = if (reason == "MUTED") OCR_MUTED_MIN_INTERVAL_MS else OCR_MIN_INTERVAL_MS
     val last = if (reason == "MUTED") lastMutedOcrAt else lastOcrAt
@@ -84,24 +119,43 @@ class RideAccessibilityService : AccessibilityService() {
       Log.d(TAG, "[KMPro][Ocr] cooldown, ignorando reason=$reason")
       return
     }
-    if (OfferOverlay.isVisible()) {
-      Log.d(TAG, "[KMPro][Ocr] cartão visível, OCR pausado reason=$reason")
-      return
-    }
     if (reason == "MUTED") lastMutedOcrAt = now else lastOcrAt = now
     Log.d(TAG, "[KMPro][Ocr] iniciando captura reason=$reason")
     val engine = ocr ?: ScreenOcr(this).also { ocr = it }
-    engine.capture { lines ->
+    engine.capture(
+      findRegion = { lines, width, height ->
+        // Descarta o texto do próprio cartão do KMPro: sem isso o "15 min / 5,7 km"
+        // dele vira uma perna fantasma e o OCR também relê a oferta que acabou de
+        // ser mostrada. Antes isso era evitado pausando o OCR enquanto o cartão
+        // estava na tela, o que impedia detectar a corrida seguinte.
+        val clean = withoutOwnCards(lines)
+        OfferRegionFinder.find(OfferParser.analyze(clean.map { it.text }), clean, width, height)
+      },
+    ) { read ->
       handler.post {
-        if (lines.isEmpty()) return@post
-        Log.d(TAG, "[KMPro][Ocr] reason=$reason linhas=${lines.size}")
-        handleOcrLines(lines)
+        if (read.full.isEmpty()) return@post
+        Log.d(TAG, "[KMPro][Ocr] reason=$reason linhas=${read.full.size} regiao=${read.region != null}")
+        handleOcrRead(read)
       }
     }
+  }
+
+  /** Remove as linhas que caem dentro de um cartão visível do KMPro. */
+  private fun withoutOwnCards(lines: List<OcrLine>): List<OcrLine> {
+    val cards = OfferOverlay.visibleCardRects()
+    if (cards.isEmpty()) return lines
+    return lines.filter { line -> cards.none { it.intersects(line.rect) } }
   }
   private val pollRunnable = object : Runnable {
     override fun run() {
       runCatching {
+        // Copiloto pausado: nada é capturado nem emitido (OfferManager.addOffer
+        // já descarta), então varrer a árvore e rodar OCR a cada tick só gastava
+        // bateria. O gatilho de retomada é o próprio botão Iniciar, que reativa
+        // o serviço; aqui basta não fazer trabalho enquanto estiver parado.
+        if (!OfferManager.isCopilotoActive(this@RideAccessibilityService)) {
+          return@runCatching
+        }
         val hasWatched = windows.any { w ->
           w.root?.let {
             OfferManager.isWatched(
@@ -127,16 +181,18 @@ class RideAccessibilityService : AccessibilityService() {
     // Dedup: the system can rebind this service repeatedly (KNOX audit); make
     // sure a single connection does not stack duplicate polls.
     handler.removeCallbacksAndMessages(null)
-    lastScanAt = 0L
     lastScreenSignature = ""
-    lastOfferSignatureByPkg.clear()
+    RideLifecycle.clear()
     OfferManager.setAccessibilityConnected(this, true)
     if (ocr == null) {
       ocr = ScreenOcr(this)
       Log.d(TAG, "[KMPro][Ocr] motor de OCR pronto (on-device)")
     }
-    // Capture the screen as soon as the service binds.
-    handler.post { scanActiveWindow("SERVICE_CONNECTED") }
+    // Capture the screen as soon as the service binds — mas só se o Copiloto
+    // estiver ativo; pausado, o POLL abaixo fica ocioso até o Iniciar.
+    if (OfferManager.isCopilotoActive(this)) {
+      handler.post { scanActiveWindow("SERVICE_CONNECTED") }
+    }
     // Reliable capture: keep sampling watched windows while the service is up.
     handler.postDelayed(pollRunnable, POLL_INTERVAL_MS)
   }
@@ -149,7 +205,7 @@ class RideAccessibilityService : AccessibilityService() {
     )
     handler.removeCallbacksAndMessages(null)
     handler.removeCallbacks(pollRunnable)
-    lastOfferSignatureByPkg.clear()
+    RideLifecycle.clear()
     AppWindowBounds.clear()
     ocr?.release()
     ocr = null
@@ -164,6 +220,10 @@ class RideAccessibilityService : AccessibilityService() {
       TAG,
       "[KMPro][Accessibility] package=$packageName event=${eventTypeName(event.eventType)}",
     )
+
+    // Pausado, eventos não disparam varredura: o POLL também está parado, então
+    // nenhum trabalho de captura acontece até o usuário dar Iniciar.
+    if (!OfferManager.isCopilotoActive(this)) return
 
     if (!OfferManager.isWatched(this, packageName)) return
 
@@ -209,38 +269,33 @@ class RideAccessibilityService : AccessibilityService() {
     }
   }
 
-  /**
-   * Diagnostic deep dive while a watched window is muted: walk EVERY retrieved
-   * window (any package, including ones we don't watch) and report the first
-   * non-empty texts found. This locates the real offer text when our chosen
-   * root turns out to be an empty ImageView.
-   */
-  private fun dumpAllWindowsText() {
-    runCatching {
-      val active = rootInActiveWindow
-      val activePkg = active?.packageName?.toString() ?: "-"
-      val activeTexts = active?.let { TreeDump.allText(it).distinct() }.orEmpty()
-      if (activeTexts.isNotEmpty()) {
+  private fun scanActiveWindow(reason: String) {
+    val startedAt = System.currentTimeMillis()
+    // Varredura dirigida por evento chegando logo depois de outra varredura
+    // qualquer: a árvore já foi lida e o POLL cobre o intervalo. Pular aqui é o
+    // que impede o handler de ser inundado — o resto do método continua igual.
+    if (reason == "CONTENT_FAST" || reason == "CONTENT_DEBOUNCE") {
+      val sinceLast = startedAt - lastScanDoneAt
+      if (lastScanDoneAt != 0L && sinceLast < EVENT_SCAN_MIN_GAP_MS) {
         Log.d(
           TAG,
-          "[KMPro][Diag] DIVE activeWindow pkg=$activePkg texts=[${activeTexts.take(24).joinToString(" ;; ")}]",
+          "[KMPro][Accessibility] evento adiado reason=$reason " +
+            "ms_desde_ultima_varredura=$sinceLast (piso=${EVENT_SCAN_MIN_GAP_MS}ms)",
         )
+        return
       }
-      for (w in windows) {
-        val root = w.root ?: continue
-        val pkg = root.packageName?.toString() ?: "-"
-        val texts = TreeDump.allText(root).distinct()
-        if (texts.isNotEmpty()) {
-          Log.d(
-            TAG,
-            "[KMPro][Diag] DIVE window id=${w.id} type=${w.type} pkg=$pkg texts=[${texts.take(24).joinToString(" ;; ")}]",
-          )
-        }
-      }
+    }
+    try {
+      scanWatchedRoots(reason, startedAt)
+    } finally {
+      // Todo caminho de saída conta, inclusive os que voltaram por dedup: a porta
+      // de eventos só é justa se uma varredura que NÃO produziu nada novo ainda
+      // conta como leitura da árvore.
+      lastScanDoneAt = System.currentTimeMillis()
     }
   }
 
-  private fun scanActiveWindow(reason: String) {
+  private fun scanWatchedRoots(reason: String, now: Long) {
     // The ride-app offer card is an INTERACTIVE overlay window (only visible to
     // clients with FLAG_RETRIEVE_INTERACTIVE_WINDOWS). rootInActiveWindow alone
     // may return the map behind it, so we walk every retrieved window and scan
@@ -264,7 +319,12 @@ class RideAccessibilityService : AccessibilityService() {
     // — rotação, redimensionamento e fechamento de app reancoram sozinhos.
     runCatching {
       val alive = mutableSetOf<String>()
+      // Lista de janelas vazia pode ser transitória (rebind, rotação): sem essa
+      // marca, um intervalo sem janelas esconderia cartões de ofertas ainda na
+      // tela — e o dedup de assinatura impediria o re-show.
+      var sawAnyWindow = false
       for (w in windows) {
+        sawAnyWindow = true
         val root = w.root ?: continue
         val pkg = root.packageName?.toString().orEmpty()
         if (!OfferManager.isWatched(this, pkg)) continue
@@ -284,6 +344,20 @@ class RideAccessibilityService : AccessibilityService() {
         )
       }
       AppWindowBounds.retain(alive)
+      // Um app que saiu desta varredura (fechado/minimizado) encerra a oferta
+      // dele: esconde só o cartão daquele pacote — em tela dividida, o cartão do
+      // outro app permanece. O hide geral abaixo cobre quando TODAS as janelas
+      // vigiadas somem.
+      if (sawAnyWindow) {
+        val gone = lastSeenWatchedPkgs - alive
+        for (pkg in gone) {
+          Log.d(TAG, "[KMPro][Accessibility] app saiu da tela, escondendo cartão pkg=$pkg")
+          OfferManager.dropOffersFor(this, pkg)
+          OfferManager.hideOfferOverlayFor(pkg)
+          RideLifecycle.forget(pkg)
+        }
+        lastSeenWatchedPkgs = alive
+      }
     }
     // Reancora cartões já visíveis sem esperar a próxima oferta: se o usuário
     // abriu tela dividida (ou girou o tablet) com um cartão na tela, ele precisa
@@ -295,16 +369,27 @@ class RideAccessibilityService : AccessibilityService() {
     if (roots.isEmpty()) {
       Log.d(TAG, "[KMPro][Accessibility] sem raiz vigiada reason=$reason")
       dumpWindows("sem_raiz")
+      // `alive` já escondeu o cartão de um app que fechou; aqui cobre o caso de
+      // TODAS as janelas vigiadas terem sumido (app único fechado/minimizado):
+      if (reason == "WINDOW_STATE" || reason == "SERVICE_CONNECTED" || reason == "POLL") {
+        OfferManager.hideOfferOverlay()
+      }
       return
     }
     if (reason == "CONTENT_FAST" || reason == "WINDOW_STATE" || reason == "SERVICE_CONNECTED") {
       dumpWindows("scan")
     }
 
-    val now = System.currentTimeMillis()
+    // Uma leitura por raiz, reutilizada na assinatura e no laço de ofertas. Antes
+    // a mesma árvore era percorrida com TreeDump.allText() duas vezes (aqui e de
+    // novo dentro do laço) e o primeiro root ainda era lido uma terceira vez no
+    // bloco de esconder o cartão. A varredura é síncrona no handler principal,
+    // então cada duplicata atrasa o tick do POLL.
+    val textsByRoot = LinkedHashMap<AccessibilityNodeInfo, List<String>>()
     val overallSig = roots
       .joinToString("~") { r ->
         val texts = TreeDump.allText(r).distinct()
+        textsByRoot[r] = texts
         val muted = texts.isEmpty() && TreeDump.collect(r).isNotEmpty()
         r.packageName.toString() + "|" + texts.joinToString(" ") + if (muted) "|MUTED" else ""
       }
@@ -316,7 +401,6 @@ class RideAccessibilityService : AccessibilityService() {
       }
     }
     lastScreenSignature = overallSig
-    lastScanAt = now
 
     /**
      * Uma oferta por app: em tela dividida com Uber e 99 oferecendo juntas, cada
@@ -328,8 +412,9 @@ class RideAccessibilityService : AccessibilityService() {
 
     for (root in roots) {
       val rootPackage = root.packageName?.toString().orEmpty()
-      val textLinesTotal = TreeDump.allText(root)
-      var textLines = textLinesTotal.distinct()
+      // Reaproveita a leitura da assinatura; a raiz está sempre no mapa porque a
+      // assinatura percorre exatamente as mesmas raízes, na mesma ordem.
+      val textLines = textsByRoot[root] ?: TreeDump.allText(root).distinct()
       val nodes = TreeDump.collect(root)
 
       Log.d(
@@ -372,23 +457,44 @@ class RideAccessibilityService : AccessibilityService() {
       if (offer != null) offersByPkg[rootPackage] = offer
     }
 
+    /**
+     * Presença/ausência de corrida por app, avaliada em TODAS as varreduras e
+     * para TODOS os roots — não só quando nenhuma app tem oferta.
+     *
+     * Duas correções para o acionamento do cartão:
+     *
+     * 1. Era avaliado só `roots.first()`. Com Uber e 99 abertos, se a primeira
+     * janela estivesse muda, o `if (segs.isNotEmpty())` falhava e NENHUM cartão
+     * era removido — inclusive o do app que realmente tinha encerrado a corrida.
+     *
+     * 2. Fica dentro de `offersByPkg.isEmpty()`, então uma app com oferta
+     * "blindava" a outra: a 99 podia encerrar a corrida com a Uber ainda
+     * oferecendo e o cartão da 99 ficaria na tela.
+     */
+    if (reason == "WINDOW_STATE" || reason == "SERVICE_CONNECTED" || reason == "POLL") {
+      for (root in roots) {
+        val pkg = root.packageName?.toString().orEmpty()
+        if (pkg.isBlank() || pkg in offersByPkg) continue
+        // Ausência só prova alguma coisa numa tela normal: uma raiz muda
+        // significa que a árvore não expõe nada (o painel de oferta não é
+        // publicado nela), então não dá para concluir nada por ali.
+        if (textsByRoot[root].isNullOrEmpty()) continue
+        if (!RideLifecycle.observeAbsent(pkg)) continue
+        Log.d(TAG, "[KMPro][Ride] corrida encerrada pkg=$pkg (${RideLifecycle.describe(pkg)})")
+        // O dedup tem que morrer JUNTO com a oferta: com a assinatura guardada,
+        // a próxima corrida — mesmo com valores idênticos — parecia repetida e o
+        // cartão não voltava nunca.
+        OfferManager.dropOffersFor(this, pkg)
+        OfferManager.hideOfferOverlayFor(pkg)
+      }
+    }
+
     if (offersByPkg.isEmpty()) {
       // The overlay card must leave when the offer is gone from a real screen.
       if (reason == "WINDOW_STATE" || reason == "SERVICE_CONNECTED" || reason == "POLL") {
-        val firstRoot = roots.firstOrNull()
-        val segs = firstRoot?.let { TreeDump.allText(it).distinct() }.orEmpty()
-        // Only hide once a normal (non-silent) watched screen is back.
-        if (segs.isNotEmpty()) {
-          // Esconde apenas o cartão cuja oferta saiu da tela. Em tela dividida
-          // com Uber e 99 abertos, uma tela normal da Uber não pode derrubar o
-          // cartão da 99 (e vice-versa) — cada root vigiado mapeia para o seu
-          // próprio pacote.
-          for (root in roots) {
-            val pkg = root.packageName?.toString().orEmpty()
-            if (pkg.isNotBlank()) OfferManager.hideOfferOverlayFor(pkg)
-          }
-          Log.d(TAG, "[KMPro][OfferParser] oferta encerrada, cartões dos apps sem oferta removidos")
-        }
+        // Terceira leitura da mesma raiz eliminada: o texto já foi lido na
+        // assinatura.
+        val segs = roots.firstOrNull()?.let { textsByRoot[it] }.orEmpty()
         val analysis = OfferParser.analyze(segs)
         if (reason == "WINDOW_STATE" || reason == "SERVICE_CONNECTED") {
           Log.d(TAG, "[KMPro][OfferParser] NOT AN OFFER reason=${analysis.rejectReason}")
@@ -404,12 +510,17 @@ class RideAccessibilityService : AccessibilityService() {
     // inserção (LinkedHashMap) preserva quem apareceu primeiro — é essa ordem
     // que a fila do overlay segue quando não puder exibir ambos ao mesmo tempo.
     for ((pkg, offer) in offersByPkg) {
+      // A corrida voltou depois de ter sido declarada encerrada: este é o único
+      // caminho que reexibe o cartão com os mesmos valores de antes.
+      if (RideLifecycle.observePresent(pkg)) {
+        Log.d(TAG, "[KMPro][Ride] nova corrida pkg=$pkg (${RideLifecycle.describe(pkg)})")
+      }
       val signature = OfferParser.offerSignature(offer)
-      if (signature == lastOfferSignatureByPkg[pkg]) {
+      if (signature == RideLifecycle.shownSignature(pkg)) {
         Log.d(TAG, "[KMPro][OfferParser] oferta repetida de $pkg, ignorada")
         continue
       }
-      lastOfferSignatureByPkg[pkg] = signature
+      RideLifecycle.markShown(pkg, signature)
       val fare = offer["fare"]?.toString() ?: "?"
       val distance = offer["distance"]?.toString() ?: "?"
       val duration = offer["durationMinutes"]?.toString() ?: "?"
@@ -424,37 +535,81 @@ class RideAccessibilityService : AccessibilityService() {
 
   /**
    * OCR never touches the accessibility tree, so it has to identify the offer
-   * app itself: the capture always contains the whole screen, so the first line
-   * that names a watched package header (or a fare) decides whose screen this is.
+   * app itself. Classification prefers the cropped region (the full screen also
+   * carries promo banners — 99's "9l 100" used to be read as a 99 header during
+   * an Uber offer) and falls back to the full screen when there was no region.
+   * The offer itself is read from the region when available: the second pass is
+   * the authoritative one, over the big card text only.
    */
-  private fun handleOcrLines(lines: List<String>) {
+  private fun handleOcrRead(read: ScreenOcr.Read) {
     val now = System.currentTimeMillis()
-    val packageName = watchedPackageFromOcr(lines) ?: run {
-      Log.d(TAG, "[KMPro][Ocr] nenhuma tela vigiada reconhecida, ignorada")
-      return
+    val full = withoutOwnCards(read.full)
+    val regionLines = withoutOwnCards(read.regionLines)
+    if (full.isEmpty()) return
+
+    val packageName = regionLines.map { it.text }
+      .takeIf { it.isNotEmpty() }
+      ?.let { watchedPackageFromOcr(it) }
+      ?: watchedPackageFromOcr(full.map { it.text })
+      ?: run {
+        Log.d(TAG, "[KMPro][Ocr] nenhuma tela vigiada reconhecida, ignorada")
+        return
+      }
+
+    val fullTexts = full.map { it.text }
+    val regionTexts = if (read.region != null && regionLines.isNotEmpty()) {
+      regionLines.map { it.text }
+    } else {
+      emptyList()
     }
-    val joined = lines.joinToString(" | ")
-    val offer = OfferParser.extractOffer(
-      key = "ocr-$now",
-      packageName = packageName,
-      windowTexts = lines,
-      capturedAt = now,
-    )
+    fun extract(texts: List<String>): Map<String, Any?>? =
+      if (texts.isEmpty()) {
+        null
+      } else {
+        OfferParser.extractOffer(
+          key = "ocr-$now",
+          packageName = packageName,
+          windowTexts = texts,
+          capturedAt = now,
+        )
+      }
+
+    // O recorte é a leitura preferida (texto maior, menos erro de dígito), mas
+    // pode perder uma linha: numa oferta real da Uber em tela dividida o crop
+    // deixou de fora o "8 min" e o "Selecionar", e a segunda passada, sozinha,
+    // não fechou a oferta. Se o recorte não fechar, cai para a tela inteira —
+    // que foi quem achou a região e normalmente fecha.
+    val offer = extract(regionTexts) ?: extract(fullTexts)
     if (offer == null) {
-      val analysis = OfferParser.analyze(lines)
+      val attempted = regionTexts.ifEmpty { fullTexts }
+      val analysis = OfferParser.analyze(attempted)
       Log.d(
         TAG,
         "[KMPro][Ocr] nao-oferta pkg=$packageName reason=${analysis.rejectReason} " +
-          "texts=[${lines.take(20).joinToString(" ;; ") { it.take(80) }}]",
+          "texts=[${attempted.take(20).joinToString(" ;; ") { it.take(80) }}]",
       )
+      // Uma tela vigiada está nos pixels mas sem corrida: a corrida acabou, mesmo
+      // que a árvore demore a soltar. Mesmo ciclo da varredura da árvore.
+      if (RideLifecycle.isOnScreen(packageName) && RideLifecycle.observeAbsent(packageName)) {
+        Log.d(TAG, "[KMPro][Ride] corrida encerrada pkg=$packageName (via OCR)")
+        OfferManager.dropOffersFor(this, packageName)
+        OfferManager.hideOfferOverlayFor(packageName)
+      }
       return
     }
     val signature = OfferParser.offerSignature(offer)
-    if (signature == lastOfferSignatureByPkg[packageName]) {
+    // Mesmo caminho de ciclo da árvore: o OCR marca a corrida presente e guarda a
+    // assinatura, e quem decide que a corrida acabou é a varredura da árvore (que
+    // vê a tela normal voltar). Sem as duas pontas conversando, um lado limpava o
+    // dedup que o outro tinha acabado de gravar.
+    if (RideLifecycle.observePresent(packageName)) {
+      Log.d(TAG, "[KMPro][Ride] nova corrida pkg=$packageName (via OCR)")
+    }
+    if (signature == RideLifecycle.shownSignature(packageName)) {
       Log.d(TAG, "[KMPro][Ocr] oferta repetida, ignorada")
       return
     }
-    lastOfferSignatureByPkg[packageName] = signature
+    RideLifecycle.markShown(packageName, signature)
     val fare = offer["fare"]?.toString() ?: "?"
     val distance = offer["distance"]?.toString() ?: "?"
     val duration = offer["durationMinutes"]?.toString() ?: "?"

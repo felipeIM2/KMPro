@@ -3,6 +3,7 @@ import {
   DEFAULT_COST_SETTINGS,
   DEFAULT_METRIC_ORDER,
   RIDE_APPS,
+  hourlyCost,
   type AppId,
   type CostSettings,
   type MetricId,
@@ -151,8 +152,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       gainHourMin: goals.gainHour[0],
       gainHourMax: goals.gainHour[1],
       ratingMin: goals.rating,
+      custoHora: hourlyCost(costSettings),
     }).catch(() => {});
-  }, [goals]);
+  }, [goals, costSettings]);
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }

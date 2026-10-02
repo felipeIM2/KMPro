@@ -8,11 +8,20 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 
 class KmproForegroundService : Service() {
   private var wakeLock: PowerManager.WakeLock? = null
+  private val handler = Handler(Looper.getMainLooper())
+  private val renewRunnable = object : Runnable {
+    override fun run() {
+      acquireWakeLock()
+      handler.postDelayed(this, WAKE_LOCK_RENEW_MS)
+    }
+  }
 
   override fun onBind(intent: Intent?): IBinder? = null
 
@@ -20,6 +29,10 @@ class KmproForegroundService : Service() {
     super.onCreate()
     startAsForeground()
     acquireWakeLock()
+    // O wakelock é adquirido com timeout e renovado enquanto o serviço viver:
+    // se o sistema matar o serviço sem chamar onDestroy, ele expira sozinho em
+    // vez de manter a tela acesa indefinidamente.
+    handler.postDelayed(renewRunnable, WAKE_LOCK_RENEW_MS)
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -29,6 +42,7 @@ class KmproForegroundService : Service() {
   }
 
   override fun onDestroy() {
+    handler.removeCallbacks(renewRunnable)
     wakeLock?.takeIf { it.isHeld }?.release()
     wakeLock = null
     super.onDestroy()
@@ -36,6 +50,9 @@ class KmproForegroundService : Service() {
 
   private fun acquireWakeLock() {
     val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+    // Solta a referência anterior antes de readquirir: acquire() em um lock já
+    // mantido apenas incrementa a contagem, e um único release não o soltaria.
+    wakeLock?.takeIf { it.isHeld }?.release()
     wakeLock = try {
       pm.newWakeLock(
         PowerManager.SCREEN_DIM_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
@@ -44,7 +61,7 @@ class KmproForegroundService : Service() {
     } catch (_: SecurityException) {
       null
     }
-    wakeLock?.acquire()
+    wakeLock?.acquire(WAKE_LOCK_TIMEOUT_MS)
   }
 
   private fun startAsForeground() {
@@ -73,6 +90,10 @@ class KmproForegroundService : Service() {
 
   companion object {
     private const val NOTIF_ID = 1001
+
+    /** Timeout do wakelock e intervalo de renovação (renova antes de expirar). */
+    private const val WAKE_LOCK_TIMEOUT_MS = 10 * 60 * 1000L
+    private const val WAKE_LOCK_RENEW_MS = 9 * 60 * 1000L
 
     fun start(context: Context) {
       val intent = Intent(context, KmproForegroundService::class.java)

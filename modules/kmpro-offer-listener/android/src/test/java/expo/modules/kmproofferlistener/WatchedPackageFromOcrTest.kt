@@ -98,9 +98,44 @@ class WatchedPackageFromOcrTest {
 
   @Test
   fun `a bare launcher screen yields no package`() {
-    // The "Gigu" text can appear in the recents list without any ride app open.
+    // Unrelated app labels can appear in the recents list without any ride app open.
     assertNull(
-      WatchedApp.fromOcrLines(listOf("Gigu", "99", "Calculadora")),
+      WatchedApp.fromOcrLines(listOf("Fotos", "99", "Calculadora")),
+    )
+  }
+
+  @Test
+  fun `uber radar is not mistaken for 99 by a distance read as 9l`() {
+    // Regression, seen live: the Uber Radar screen OCRs "13 minutos (9.3 km)" as
+    // "9l", and the bare contains("9l") match filed the whole screen under 99
+    // while Uber was the app in the foreground.
+    assertEquals(
+      "com.ubercab.driver",
+      WatchedApp.fromOcrLines(
+        listOf("Radar de Viagens", "Procurando viagens", "13 minutos (9l km)", "UberX"),
+      ),
+    )
+  }
+
+  @Test
+  fun `a 99 promo banner alone does not claim the screen for 99`() {
+    // Uber's Radar carries the 99 R$100 banner. With Uber's own labels present
+    // the screen must stay Uber's.
+    assertEquals(
+      "com.ubercab.driver",
+      WatchedApp.fromOcrLines(
+        listOf("Radar de Viagens", "Procurando viagens", "9l100", "UberX"),
+      ),
+    )
+  }
+
+  @Test
+  fun `the 99 logo still wins when the logo itself is on screen`() {
+    // The anchored match is not a loosening: "9l100" is the 99 logo plus its
+    // value, and with no Uber marker present 99 must still win.
+    assertEquals(
+      "com.app99.driver",
+      WatchedApp.fromOcrLines(listOf("9l100", "0/500 pontos", "Procurando")),
     )
   }
 }

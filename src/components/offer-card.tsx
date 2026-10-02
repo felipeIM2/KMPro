@@ -1,6 +1,6 @@
 import * as React from 'react';
 import { Text, View } from 'react-native';
-import { ArrowRight, Star } from 'lucide-react-native';
+import { Star } from 'lucide-react-native';
 import type { AppId, MetricId } from '@/constants';
 import { totalCostPerKm } from '@/constants';
 import { Separator } from './ui/separator';
@@ -24,8 +24,6 @@ const TONE_BADGE: Record<OfferCardTone, string> = {
 
 export type OfferCardData = {
   app: AppId;
-  origin: string;
-  destination: string;
   km: number;
   minutes: number;
   value: number;
@@ -58,6 +56,8 @@ type OfferCardProps = {
   tone?: OfferCardTone;
   /** Faixa de cada métrica, para a prévia bater com o card nativo. */
   tones?: MetricTones;
+  /** Custo por km configurado pelo usuário; sem ele, usa o padrão. */
+  costPerKm?: number;
   className?: string;
 };
 
@@ -66,9 +66,10 @@ export function OfferCard({
   order,
   tone = 'good',
   tones,
+  costPerKm: costPerKmProp,
   className,
 }: OfferCardProps) {
-  const costPerKm = totalCostPerKm();
+  const costPerKm = costPerKmProp ?? totalCostPerKm();
   const border = TONE_BORDER[tone];
 
   return (
@@ -77,7 +78,7 @@ export function OfferCard({
           `-mt-4` + `z-10` reproduzem o topo negativo do overlay nativo. */}
       <Text
         className={cn(
-          'z-10 -mb-4 -mt-4 rounded-full px-2.5 py-1 text-[13px] font-bold',
+          'z-10 -mb-4 -mt-4 rounded-full px-2.5 py-1 text-[16px] font-bold',
           TONE_BADGE[tone]
         )}
       >
@@ -96,21 +97,16 @@ export function OfferCard({
           const value = metricValue(id, offer, costPerKm);
           // A faixa de Metas manda na cor; sem faixa, só lucro destaca.
           const metricTone = tones?.[id];
-          const isProfit = !metricTone && (id === 'lucro' || id === 'lucroHora');
 
           return (
             <View key={id} className="items-center">
-              <Text className="text-[10px] text-muted-foreground">
+              <Text className="text-[14px] text-muted-foreground">
                 {METRIC_CARD_LABEL[id]}
               </Text>
               <Text
                 className={cn(
-                  'text-[16px] font-bold',
-                  metricTone
-                    ? TONE_TEXT[metricTone]
-                    : isProfit
-                      ? 'text-primary'
-                      : 'text-foreground'
+                  'text-[24px] font-bold',
+                  metricTone ? TONE_TEXT[metricTone] : 'text-foreground'
                 )}
               >
                 {formatNumber(value, 2)}
@@ -124,11 +120,11 @@ export function OfferCard({
 
       <View className="gap-2 bg-secondary p-3.5">
         <View className="flex-row items-center gap-2">
-          <Text className="text-xs font-medium text-foreground">
+          <Text className="text-[14px] font-medium text-foreground">
             {offer.minutes} min
           </Text>
           <View className="h-1 w-1 rounded-full bg-muted-foreground" />
-          <Text className="text-xs font-medium text-foreground">
+          <Text className="text-[14px] font-medium text-foreground">
             {formatNumber(offer.km, 1)} km
           </Text>
 
@@ -136,10 +132,10 @@ export function OfferCard({
 
           {offer.rating ? (
             <View className="flex-row items-center gap-1">
-              <Star size={11} color="#f59e0b" fill="#f59e0b" />
+              <Star size={13} color="#f59e0b" fill="#f59e0b" />
               <Text
                 className={cn(
-                  'text-[11px] font-semibold',
+                  'text-[13px] font-semibold',
                   tones?.rating
                     ? TONE_TEXT[tones.rating]
                     : 'text-foreground'
@@ -150,24 +146,6 @@ export function OfferCard({
             </View>
           ) : null}
         </View>
-
-        <Separator />
-
-        <View className="flex-row items-center gap-2">
-          <Text
-            numberOfLines={1}
-            className="flex-1 text-xs text-muted-foreground"
-          >
-            {offer.origin}
-          </Text>
-            <ArrowRight size={12} color="#525252" />
-            <Text
-              numberOfLines={1}
-              className="flex-1 text-right text-xs font-medium text-foreground"
-            >
-              {offer.destination}
-            </Text>
-          </View>
         </View>
       </View>
     </View>

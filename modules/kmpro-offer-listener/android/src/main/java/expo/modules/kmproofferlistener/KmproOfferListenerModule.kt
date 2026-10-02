@@ -90,7 +90,8 @@ class KmproOfferListenerModule : Module() {
         gainKmMax: Double,
         gainHourMin: Double,
         gainHourMax: Double,
-        ratingMin: Double ->
+        ratingMin: Double,
+        custoHora: Double ->
       OfferManager.setCardGoals(
         context,
         gainKmMin,
@@ -98,6 +99,7 @@ class KmproOfferListenerModule : Module() {
         gainHourMin,
         gainHourMax,
         ratingMin,
+        custoHora,
       )
     }
 

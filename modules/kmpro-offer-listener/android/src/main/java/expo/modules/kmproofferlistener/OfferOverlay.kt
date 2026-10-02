@@ -95,6 +95,13 @@ object OfferOverlay {
     var lastX: Int = Int.MIN_VALUE
     var lastY: Int = Int.MIN_VALUE
     var lastWidth: Int = Int.MIN_VALUE
+    /**
+     * Retângulo do cartão na tela. O OCR da tela inteira lê o texto do PRÓPRIO
+     * cartão do KMPro e o "15 min · 5,7 km" daqui já virou uma perna fantasma
+     * numa sessão real; este retângulo permite descartar as linhas que caem
+     * dentro do cartão antes de analisar a oferta.
+     */
+    @Volatile var screenRect: OcrRect? = null
   }
 
   /** Oferta pronta para exibição, possivelmente aguardando na fila. */
@@ -177,7 +184,10 @@ object OfferOverlay {
         // Já existe um cartão sem âncora própria na tela: entra na fila e
         // aparece assim que o cartão atual esconder, na ordem de captura.
         queue.addLast(pending)
-        while (queue.size > MAX_QUEUE) queue.removeFirst()
+        while (queue.size > MAX_QUEUE) {
+          val dropped = queue.removeFirst()
+          Log.d(TAG, "fila cheia, descartando o mais antigo pkg=${dropped.anchoredPkg}")
+        }
         Log.d(TAG, "cartao em fila pkg=$pkg fila=${queue.size}")
       }
     }
@@ -245,8 +255,6 @@ object OfferOverlay {
       "distance" to 4.4,
       "durationMinutes" to 7.0,
       "costPerKm" to 0.62,
-      "pickup" to "Parque da Lagoa, Vitória",
-      "dropoff" to "R. São Carlos, Serra",
       "rating" to 4.89,
       "classification" to RideCalc.GREEN,
     )
@@ -300,10 +308,16 @@ object OfferOverlay {
     Log.d(TAG, "TREE\n$sb")
   }
 
-  /** Há algum cartão na tela agora? Usado pelo serviço para pausar o OCR e não
-   *  ler o próprio cartão de volta — causa do loop de distância/duração que
-   *  crescia a cada captura (a linha "15 min 5.7 km" viram outra perna). */
-  fun isVisible(): Boolean = cards.isNotEmpty()
+  /**
+   * Retângulos dos cartões visíveis, em coordenadas de tela. O OCR da tela
+   * inteira descarta as linhas que caem aqui antes de analisar a oferta — assim
+   * o próprio cartão do KMPro não vira oferta (nem some com a perna real) sem
+   * precisar pausar o OCR enquanto ele está na tela. A pausa antiga tinha o
+   * efeito colateral de não detectar a corrida seguinte enquanto um cartão
+   * estivesse visível.
+   */
+  fun visibleCardRects(): List<OcrRect> =
+    cards.values.mapNotNull { it.screenRect }
 
   /** Remove TODOS os cartões e limpa a fila (parar Copiloto, debug, etc.). */
   fun hide() {
@@ -337,6 +351,7 @@ object OfferOverlay {
     state.view = null
     state.wm = null
     state.params = null
+    state.screenRect = null
   }
 
   @SuppressLint("ClickableViewAccessibility")
@@ -352,11 +367,27 @@ object OfferOverlay {
     val bounds = state.anchoredPkg.takeIf { it.isNotEmpty() }
       ?.let { AppWindowBounds.get(it) }
 
+    // A borda segue o pior tom entre a classificação e cada métrica exibida,
+    // para nunca ficar verde com um mostrador vermelho/amarelo. A classificação
+    // entra como piso; sem metas configuradas, cai nela.
+    val goals = OfferManager.cardGoals(context)
+    val metrics = renderMetrics(order, pending.offer, goals)
+    val classification = pending.offer["classification"]?.toString() ?: RideCalc.GREEN
+    val accent =
+      colorFor(CardGoals.worst(listOf(classification) + metrics.map { it.tone }))
+        ?: pending.accent
+
     val container: ViewGroup
     if (state.view == null || state.metricOrder != order) {
       // Cartão novo, ou a ordem das métricas mudou em Ajustes: reconstrói.
       removeCard(state)
-      val built = buildCard(context, order, pending.accent) ?: return
+      // Falha ao montar o cartão: tira o estado do mapa para não deixar um
+      // CardState órfão (sem view) que bloquearia o cartão genérico e a fila,
+      // como se houvesse um cartão na tela.
+      val built = buildCard(context, order, accent) ?: run {
+        cards.remove(state.id)
+        return
+      }
       container = built
 
       // O card é fixo: sem arraste. Tocar nele fecha, para não cobrir os
@@ -368,7 +399,10 @@ object OfferOverlay {
       }
 
       val wm = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
-      if (wm == null) return
+      if (wm == null) {
+        cards.remove(state.id)
+        return
+      }
       val lp = WindowManager.LayoutParams(
         WindowManager.LayoutParams.WRAP_CONTENT,
         WindowManager.LayoutParams.WRAP_CONTENT,
@@ -392,8 +426,8 @@ object OfferOverlay {
       container = state.view as? ViewGroup ?: return
       applyLayout(state, bounds, position, dpi, context, isNew = false)
     }
-    applyAccent(container, context, pending.accent)
-    applyContent(container, context, order, pending.offer)
+    applyAccent(container, context, accent)
+    applyContent(container, metrics, goals, pending.offer)
 
     // Visibilidade limitada pelo seletor "Tempo de tela" de Ajustes, por cartão.
     state.hideRunnable?.let { mainHandler.removeCallbacks(it) }
@@ -450,9 +484,8 @@ object OfferOverlay {
       state.lastY = lp.y
       state.lastWidth = lp.width
     } else {
-      // `cardPosition` ancora o cartão em Ajustes, no estilo da Gigu (99):
-      // centro na tela, ou encostado na borda esquerda/direita, sempre
-      // centralizado na vertical.
+      // `cardPosition` ancora o cartão em Ajustes: centro na tela, ou
+      // encostado na borda esquerda/direita, sempre centralizado na vertical.
       lp.gravity = gravityFor(position)
       lp.x = horizontalOffset(position, dpi)
       lp.y = 0
@@ -491,6 +524,25 @@ object OfferOverlay {
         runCatching { state.wm?.updateViewLayout(container, lp) }
       }
     }
+    // O retângulo só existe depois do layout; `post` garante que o cartão já foi
+    // medido. É o que o OCR usa para descartar o texto do próprio cartão.
+    container.post { state.screenRect = rectOnScreen(container) }
+  }
+
+  /** Retângulo do cartão em coordenadas de tela, ou null se ainda não anexado. */
+  private fun rectOnScreen(container: View): OcrRect? {
+    if (!container.isAttachedToWindow) return null
+    val location = IntArray(2)
+    container.getLocationOnScreen(location)
+    val width = container.width
+    val height = container.height
+    if (width <= 0 || height <= 0) return null
+    return OcrRect(
+      left = location[0],
+      top = location[1],
+      right = location[0] + width,
+      bottom = location[1] + height,
+    )
   }
 
   /** Reaplica a âncora dos cartões visíveis (bounds/posição podem ter mudado). */
@@ -516,7 +568,7 @@ object OfferOverlay {
    *     ├── topo: fundo `card`, fileira horizontal com as métricas na ordem
    *   │          configurada (rótulo pequeno por cima, valor embaixo)
    *     ├── separador
-   *     └── base: fundo `secondary` com min/km, avaliação e origem → destino
+   *     └── base: fundo `secondary` com min/km e avaliação
    */
   private fun buildCard(
     context: Context,
@@ -559,14 +611,14 @@ object OfferOverlay {
       column.gravity = Gravity.CENTER_HORIZONTAL
       val label = TextView(context)
       label.id = ID_MLABEL_BASE + index
-      label.sizeDp(10f, density)
+      label.sizeDp(14f, density)
       label.includeFontPadding = false
       label.setTextColor(COLOR_MUTED)
       label.text = metricCardLabel(metricId)
       column.addView(label)
       val tv = TextView(context)
       tv.id = ID_METRIC_BASE + index
-      tv.sizeDp(16f, density)
+      tv.sizeDp(24f, density)
       tv.typeface = Typeface.DEFAULT_BOLD
       tv.setTextColor(COLOR_FOREGROUND)
       tv.includeFontPadding = false
@@ -599,14 +651,14 @@ object OfferOverlay {
     facts.id = ID_FACTS
     val minutes = TextView(context)
     minutes.id = ID_MINUTES
-    minutes.sizeDp(12f, density)
+    minutes.sizeDp(14f, density)
     minutes.includeFontPadding = false
     minutes.setTextColor(COLOR_FOREGROUND)
     facts.addView(minutes)
     facts.addView(dot(context))
     val km = TextView(context)
     km.id = ID_KM
-    km.sizeDp(12f, density)
+    km.sizeDp(14f, density)
     km.includeFontPadding = false
     km.setTextColor(COLOR_FOREGROUND)
     facts.addView(km)
@@ -618,60 +670,20 @@ object OfferOverlay {
     ratingGroup.gravity = Gravity.CENTER_VERTICAL
     val star = TextView(context)
     star.id = ID_STAR
-    star.sizeDp(11f, density)
+    star.sizeDp(13f, density)
     star.includeFontPadding = false
     star.text = "★"
     star.setTextColor(COLOR_WARNING)
     ratingGroup.addView(star)
     val rating = TextView(context)
     rating.id = ID_RATING
-    rating.sizeDp(11f, density)
+    rating.sizeDp(13f, density)
     rating.includeFontPadding = false
     rating.typeface = Typeface.DEFAULT_BOLD
     rating.setTextColor(COLOR_FOREGROUND)
     ratingGroup.addView(rating)
     facts.addView(ratingGroup)
     bottom.addView(facts)
-
-    bottom.addView(divider(context), LinearLayout.LayoutParams(
-      LinearLayout.LayoutParams.MATCH_PARENT,
-      dp(1f),
-    ).apply { topMargin = dp(8f); bottomMargin = dp(8f) })
-
-    // Linha 2: origem → destino
-    val route = LinearLayout(context)
-    route.orientation = LinearLayout.HORIZONTAL
-    route.gravity = Gravity.CENTER_VERTICAL
-    val origin = TextView(context)
-    origin.id = ID_ORIGIN
-    origin.sizeDp(12f, density)
-    origin.includeFontPadding = false
-    origin.setTextColor(COLOR_MUTED)
-    origin.maxLines = 1
-    origin.ellipsize = android.text.TextUtils.TruncateAt.END
-    origin.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-    route.addView(origin)
-
-    val arrow = TextView(context)
-    arrow.id = ID_ARROW
-    arrow.text = "→"
-    arrow.sizeDp(12f, density)
-    arrow.includeFontPadding = false
-    arrow.setTextColor(COLOR_MUTED)
-    route.addView(arrow)
-
-    val destination = TextView(context)
-    destination.id = ID_DESTINATION
-    destination.sizeDp(12f, density)
-    destination.includeFontPadding = false
-    destination.setTextColor(COLOR_FOREGROUND)
-    destination.maxLines = 1
-    destination.ellipsize = android.text.TextUtils.TruncateAt.END
-    // Na UI o destino é `text-right`.
-    destination.textAlignment = android.view.View.TEXT_ALIGNMENT_TEXT_END
-    destination.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-    route.addView(destination)
-    bottom.addView(route)
 
     inner.addView(bottom, LinearLayout.LayoutParams(
       LinearLayout.LayoutParams.MATCH_PARENT,
@@ -690,7 +702,7 @@ object OfferOverlay {
     card.id = ID_CARD_ROOT
 
     // Badge do valor da corrida: pílula com a cor do tom, pendurada na borda
-    // superior do card e centralizada, no mesmo contraste do "cravado" da Gigu.
+    // superior do card e centralizada, no mesmo contraste do valor "cravado".
     // Fica na mesma janela, então acompanha a âncora esquerda/centro/direita.
     //
     // A janela do overlay é WRAP_CONTENT: a badge precisa caber dentro do root,
@@ -700,7 +712,7 @@ object OfferOverlay {
     // wrap_content do root já reserva a faixa que ela ocupa.
     val badge = TextView(context)
     badge.id = ID_BADGE
-    badge.sizeDp(13f, density)
+    badge.sizeDp(16f, density)
     badge.typeface = Typeface.DEFAULT_BOLD
     badge.includeFontPadding = false
     badge.setTextColor(COLOR_FOREGROUND)
@@ -734,15 +746,12 @@ object OfferOverlay {
 
   private fun applyContent(
     container: ViewGroup,
-    context: Context,
-    order: List<String>,
+    metrics: List<RenderedMetric>,
+    goals: CardGoals,
     offer: Map<String, Any?>,
   ) {
-    val goals = OfferManager.cardGoals(context)
-    val metrics = renderMetrics(order, offer, goals)
-    order.forEachIndexed { index, metricId ->
+    metrics.forEachIndexed { index, metric ->
       val tv = container.findViewById<TextView>(ID_METRIC_BASE + index) ?: return@forEachIndexed
-      val metric = metrics[index]
       tv.text = metric.label
       tv.setTextColor(colorFor(metric.tone) ?: COLOR_FOREGROUND)
     }
@@ -770,11 +779,6 @@ object OfferOverlay {
     val fare = (offer["fare"] as? Number)?.toDouble()
     container.findViewById<TextView>(ID_BADGE)?.text =
       fare?.let { formatDecimal(it, 2) } ?: "—"
-
-    container.findViewById<TextView>(ID_ORIGIN)?.text =
-      offer["pickup"]?.toString()?.takeIf { it.isNotBlank() } ?: "Origem"
-    container.findViewById<TextView>(ID_DESTINATION)?.text =
-      offer["dropoff"]?.toString()?.takeIf { it.isNotBlank() } ?: "Destino"
   }
 
   /** `green`/`yellow`/`red` viram as cores de destaque; sem meta fica neutro. */
@@ -793,21 +797,25 @@ object OfferOverlay {
    * "100,00"); a moeda fica implícita e a unidade (/km, /h) no rótulo pequeno
    * da coluna, `metricCardLabel`.
    *
-   * As métricas com meta em Ajustes > Metas (ganho/km, ganho/hora) recebem a
-   * cor da faixa em que o valor caiu; lucro e lucro/hora não têm faixa e ficam
-   * neutros.
+   * As métricas de Ajustes > Metas (ganho/km, ganho/hora, nota) seguem as
+   * faixas configuradas. O lucro/h sai do custo por hora de Informações de
+   * Custos; o lucro por viagem usa o mesmo alvo por hora, escalado pela duração
+   * da oferta.
    */
   private fun renderMetrics(
     order: List<String>,
     offer: Map<String, Any?>,
     goals: CardGoals,
   ): List<RenderedMetric> {
+    val minutes = (offer["durationMinutes"] as? Number)?.toDouble()
     return order.map { id ->
       val (value, _) = metricParts(id, offer)
-      RenderedMetric(
-        label = formatDecimal(value, 2),
-        tone = goals.toneFor(id, value),
-      )
+      val tone = if (id == "lucro") {
+        goals.toneForLucro(value, minutes)
+      } else {
+        goals.toneFor(id, value)
+      }
+      RenderedMetric(label = formatDecimal(value, 2), tone = tone)
     }
   }
 
@@ -929,8 +937,8 @@ object OfferOverlay {
   private fun currentDensity(context: Context): Float =
     context.resources.displayMetrics.density
 
-  // Âncora de tela inteira (fallback), estilo Gigu/99: centro na tela inteira
-  // ou encostado na borda, sempre com o conteúdo centralizado na vertical.
+  // Âncora de tela inteira (fallback): centro na tela inteira ou encostado
+  // na borda, sempre com o conteúdo centralizado na vertical.
   // O cartão fica sempre no topo, logo abaixo da área de notificações do
   // Android; a escolha em Ajustes só muda o eixo horizontal.
   private fun gravityFor(position: String): Int = when (position) {
@@ -988,9 +996,6 @@ object OfferOverlay {
   private const val ID_KM = 0x4b4d0022
   private const val ID_RATING = 0x4b4d0023
   private const val ID_STAR = 0x4b4d0031
-  private const val ID_ORIGIN = 0x4b4d0024
-  private const val ID_ARROW = 0x4b4d0025
-  private const val ID_DESTINATION = 0x4b4d0026
 
   private fun prefs(context: Context) =
     context.applicationContext.getSharedPreferences(

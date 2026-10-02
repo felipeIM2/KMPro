@@ -135,60 +135,7 @@ class OfferParserTest {
   }
 
   @Test
-  fun `reads origin and destination from the bare place lines`() {
-    val offer = extract(
-      listOf("Cariacica", "Nova Vila Velha", "8,4 km", "R$ 21,90", "12 min", "Aceitar"),
-    )
-    assertNotNull(offer)
-    assertEquals("Cariacica", offer!!.get("pickup"))
-    assertEquals("Nova Vila Velha", offer.get("dropoff"))
-  }
-
-  @Test
-  fun `keeps the neighbourhood from a full address`() {
-    val offer = extract(
-      listOf(
-        "Rua José Joaquim da Silva, Centro, Vitória", "Av. Nossa Senhora, Jardim da Penha, Serra",
-        "R$ 21,90", "8,4 km", "12 min", "Aceitar",
-      ),
-    )
-    assertNotNull(offer)
-    // 3 partes: o card mostra o bairro do meio.
-    assertEquals("Centro", offer!!.get("pickup"))
-    assertEquals("Jardim da Penha", offer.get("dropoff"))
-  }
-
-  @Test
-  fun `skips the house number in the middle of the address`() {
-    val offer = extract(
-      listOf(
-        "Rua Chagas Freitas, 300, Vila Nova de Colaresi", "Av. Nossa Senhora, Jardim da Penha",
-        "R$ 21,90", "8,4 km", "12 min", "Aceitar",
-      ),
-    )
-    assertNotNull(offer)
-    // "300" é número de casa: cai para a próxima parte não numérica.
-    assertEquals("Vila Nova de Colaresi", offer!!.get("pickup"))
-    // 2 partes com rua no começo: o card mostra o bairro depois dela.
-    assertEquals("Jardim da Penha", offer.get("dropoff"))
-  }
-
-  @Test
-  fun `keeps a two-part address start`() {
-    val offer = extract(
-      listOf(
-        "Av. Talma Rodrigues Ribeiro, Centro industrial", "Cariacica",
-        "R$ 21,90", "8,4 km", "12 min", "Aceitar",
-      ),
-    )
-    assertNotNull(offer)
-    // 2 partes com rua no começo: mostra o bairro, não a avenida.
-    assertEquals("Centro industrial", offer!!.get("pickup"))
-    assertEquals("Cariacica", offer.get("dropoff"))
-  }
-
-  @Test
-  fun `sums pickup and dropoff legs like uber does`() {
+  fun `sums the trip legs like uber does`() {
     // Log real: a perna da coleta e a da viagem vem cada uma com km + tempo.
     val offer = extract(
       listOf(
@@ -247,35 +194,6 @@ class OfferParserTest {
   }
 
   @Test
-  fun `route ignores the action button and the rating node`() {
-    // "Aceitar" e "* 4,78 (90)|" nunca viram coleta/destino.
-    val offer = extract(
-      listOf(
-        "* 4,78 (90)|", "Aceitar", "Cariacica", "Nova Vila Velha",
-        "8,4 km", "R$ 21,90", "12 min",
-      ),
-    )
-    assertNotNull(offer)
-    assertEquals("Cariacica", offer!!.get("pickup"))
-    assertEquals("Nova Vila Velha", offer.get("dropoff"))
-  }
-
-  @Test
-  fun `routes streets to the neighbourhood on two parts`() {
-    // Log real: coleta abreviada em "Cariacica", destino com rua + bairro.
-    val offer = extract(
-      listOf(
-        "Av. Talma Rodrigues Ribeiro, Centro industrial",
-        "Rua Chagas Freitas, 300, Vila Nova de Colaresi",
-        "9min (5.4 km)", "6 minutos (1.9 km)", "R$ 12,06", "Aceitar",
-      ),
-    )
-    assertNotNull(offer)
-    assertEquals("Centro industrial", offer!!.get("pickup"))
-    assertEquals("Vila Nova de Colaresi", offer.get("dropoff"))
-  }
-
-  @Test
   fun `reads the rating when OCR renders the star as A with a count`() {
     val offer = extract(
       listOf("R$ 21,90", "8,4 km", "12 min", "A 4,87 (90)", "Aceitar"),
@@ -291,5 +209,127 @@ class OfferParserTest {
     )
     assertNotNull(offer)
     assertEquals(4.78, ((offer!!.get("rating") as? Double) ?: -1.0), 0.001)
+  }
+
+  @Test
+  fun `the same offer with a shaky last cent keeps one signature`() {
+    // Regression, seen live: the same panel OCR'd as 13.0, then 13.01, then 13.0
+    // across three scans, and the raw string signature let all three through, so
+    // the card flickered and Flutter got three ride_offer events.
+    val a = mapOf("fare" to 13.0, "distance" to 1.4, "durationMinutes" to 5.0)
+    val b = mapOf("fare" to 13.01, "distance" to 1.4, "durationMinutes" to 5.0)
+    val c = mapOf("fare" to 13.0, "distance" to 1.4, "durationMinutes" to 5.0)
+    assertEquals(OfferParser.offerSignature(a), OfferParser.offerSignature(b))
+    assertEquals(OfferParser.offerSignature(b), OfferParser.offerSignature(c))
+  }
+
+  @Test
+  fun `genuinely different offers keep different signatures`() {
+    val a = mapOf("fare" to 13.0, "distance" to 1.4, "durationMinutes" to 5.0)
+    val b = mapOf("fare" to 13.05, "distance" to 1.4, "durationMinutes" to 5.0)
+    val c = mapOf("fare" to 13.0, "distance" to 2.4, "durationMinutes" to 5.0)
+    val d = mapOf("fare" to 13.0, "distance" to 1.4, "durationMinutes" to 6.0)
+    val sigs = listOf(a, b, c, d).map { OfferParser.offerSignature(it) }
+    assertEquals(4, sigs.distinct().size)
+  }
+
+  @Test
+  fun `a non numeric fare still signs rather than crashing`() {
+    val sig = OfferParser.offerSignature(mapOf("fare" to "?", "distance" to "?", "durationMinutes" to "?"))
+    assertEquals("null|null|null", sig)
+  }
+
+  @Test
+  fun `the same per km estimate is one offer across its cent noise`() {
+    // Real readings of one Uber panel, all the same R$ 1,37/km estimate:
+    // 13.0, 13.01, 13.018, 13.021, 13.024, 13.044287.
+    val noisy = listOf(13.0, 13.01, 13.018, 13.021, 13.024, 13.044287)
+    val sigs = noisy.map {
+      OfferParser.offerSignature(
+        mapOf("fare" to it, "distance" to 9.5, "durationMinutes" to 15.0),
+      )
+    }
+    assertEquals("one signature expected, got $sigs", 1, sigs.distinct().size)
+  }
+
+  @Test
+  fun `different fares still separate`() {
+    val a = OfferParser.offerSignature(mapOf("fare" to 13.0, "distance" to 9.5, "durationMinutes" to 15.0))
+    val b = OfferParser.offerSignature(mapOf("fare" to 13.5, "distance" to 9.5, "durationMinutes" to 15.0))
+    val c = OfferParser.offerSignature(mapOf("fare" to 13.0, "distance" to 9.6, "durationMinutes" to 15.0))
+    val d = OfferParser.offerSignature(mapOf("fare" to 13.0, "distance" to 9.5, "durationMinutes" to 16.0))
+    assertEquals(4, listOf(a, b, c, d).distinct().size)
+  }
+
+  @Test
+  fun `rejects a fare that lost its decimal separator`() {
+    // Real reading from a live Uber session: the screen showed "R$ 17,03" and OCR
+    // returned "R$ 1703". The regex matches 4 digits happily, so the offer was
+    // accepted at a hundred times its real value and shown on the card as R$
+    // 1.703,00.
+    val analysis = OfferParser.analyze(
+      listOf("R$ 1703", "3,4 km", "17 min", "Aceitar corrida"),
+    )
+    assertFalse("misread fare accepted: $analysis", analysis.isOffer)
+    assertTrue(
+      "reject reason should name the suspect: ${analysis.rejectReason}",
+      analysis.rejectReason?.contains("implaus") == true,
+    )
+    // The misread value is kept for the diagnostic log, but it must never reach a
+    // card: only `isOffer` decides that.
+    assertEquals(1703.0, analysis.fare ?: 0.0, 0.001)
+    assertNull(extract(listOf("R$ 1703", "3,4 km", "17 min", "Aceitar corrida")))
+  }
+
+  @Test
+  fun `keeps accepting the same fare when the separator survives`() {
+    val offer = extract(listOf("R$ 17,03", "3,4 km", "17 min", "Aceitar corrida"))
+    assertEquals(17.03, ((offer!!.get("fare") as? Double) ?: 0.0), 0.001)
+  }
+
+  @Test
+  fun `a long expensive ride is still an offer`() {
+    // The band rejects misreads, not real money: an airport run over R$ 100 must
+    // not be thrown away with the misreads.
+    val offer = extract(listOf("R$ 480,00", "38,6 km", "52 min", "Aceitar corrida"))
+    assertEquals(480.00, ((offer!!.get("fare") as? Double) ?: 0.0), 0.001)
+  }
+
+  @Test
+  fun `reads a fare with a thousands separator as thousands`() {
+    // "R$ 1.248" vinha como R$ 1.248,00 -> 1.248 interpretado como decimal
+    // (R$ 1,25), dentro da faixa, e passava como oferta. Agora sai 1248 e a
+    // faixa de plausibilidade barra a leitura como milhar perdido.
+    assertEquals(1248.0, OfferParser.parseMoney("1.248") ?: 0.0, 0.001)
+    assertEquals(1248.0, OfferParser.parseMoney("1.248,00") ?: 0.0, 0.001)
+    assertEquals(18.5, OfferParser.parseMoney("18.5") ?: 0.0, 0.001)
+    assertEquals(18.5, OfferParser.parseMoney("18,50") ?: 0.0, 0.001)
+    val analysis = OfferParser.analyze(listOf("R$ 1.248", "3,4 km", "17 min", "Aceitar corrida"))
+    assertFalse("misread thousands accepted: $analysis", analysis.isOffer)
+    assertTrue(
+      "should be rejected by the plausibility band: ${analysis.rejectReason}",
+      analysis.rejectReason?.contains("implaus") == true,
+    )
+  }
+
+  @Test
+  fun `a single stray leg does not override the real distance`() {
+    // Uma linha solta "km + min" (ex.: total relido) não pode virar a distância
+    // quando não há as duas pernas da viagem; o parse por nó assume e devolve o
+    // nó de distância de verdade.
+    val offer = extract(
+      listOf("Parque da Lagoa", "9 min (5,7 km)", "R$ 12,06", "3,4 km", "17 min", "Aceitar"),
+    )
+    assertNotNull(offer)
+    assertEquals(3.4, ((offer!!.get("distance") as? Double) ?: 0.0), 0.001)
+    assertEquals(17.0, ((offer.get("durationMinutes") as? Number)?.toDouble() ?: 0.0), 0.001)
+  }
+
+  @Test
+  fun `rejects a fare read in cents`() {
+    // Same story in reverse: "R$ 1703" read as cents of a R$ 1,70 ride shows up
+    // as "R$ 0,03"-ish values, and anything under the floor is equally suspect.
+    val analysis = OfferParser.analyze(listOf("R$ 0,3", "3,4 km", "17 min", "Aceitar"))
+    assertFalse("implausibly small fare accepted: $analysis", analysis.isOffer)
   }
 }

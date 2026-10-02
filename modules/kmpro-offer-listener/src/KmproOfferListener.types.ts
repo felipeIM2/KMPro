@@ -27,9 +27,6 @@ export type RideOffer = {
   distance: number | null;
   /** Parsed duration in minutes (numeric), e.g. `22`. */
   durationMinutes: number | null;
-  /** Best-effort pickup/destination texts (may be empty). */
-  pickup: string;
-  dropoff: string;
   /** Passenger rating, e.g. `4.9` (null when not shown on the offer). */
   rating: number | null;
   /** Epoch milliseconds the offer was captured. */

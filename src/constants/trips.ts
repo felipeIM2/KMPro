@@ -133,8 +133,6 @@ export function buildStats(trips: Trip[]): PeriodStats {
 
 export const MOCK_OFFER = {
   app: 'uber' as AppId,
-  origin: 'Rua Augusta',
-  destination: 'Vila Madalena',
   km: 4.8,
   minutes: 16,
   value: 22.7,

@@ -23,14 +23,25 @@ object WatchedApp {
     val blob = lines.joinToString(" ").lowercase()
 
     // The 99 brand, in every spelling ML Kit produces for its header logo.
+    // The "9l" shape needs an anchor: the logo is always followed by its own
+    // value - "9l$90", "9l100", "9l 100". A bare contains("9l") shipped as a bug,
+    // because ML Kit also reads a distance of "9.3 km" as "9l".
     val is99 = blob.contains("99pop") ||
       blob.contains("nove e nove") ||
       blob.contains("99g") ||
       blob.contains("99l") ||
-      blob.contains("9l")
-    if (is99) return POP99
+      Regex("9l(\\s*\\d{2,}|\\$\\s*\\d)").containsMatchIn(blob)
 
-    if (blob.contains("uber") || blob.contains("übe")) return UBER
+    // Uber's own brand marker, which is unambiguous when present.
+    val uberBrand = blob.contains("uber") || blob.contains("übe")
+
+    // Precedence: an explicit Uber brand beats a 99 hit. Without this, Uber's
+    // Radar screen - which shows a 99 promotional banner ("9l100", R$ 100 for 50
+    // trips) while Uber is the app in the foreground - got filed under 99, and a
+    // screen full of Uber fares was reported as the wrong app. Seen live: Uber
+    // fares arriving with pkg=com.app99.driver.
+    if (uberBrand) return UBER
+    if (is99) return POP99
 
     // Uber's driver home screen markers. Checked last on purpose: on 99 the brand
     // match above already returned, so reaching here means the screen is Uber's

@@ -23,12 +23,6 @@ export default function TabsLayout() {
       }}
     >
       <Tabs.Screen
-        name="index"
-        options={{
-          href: null,
-        }}
-      />
-      <Tabs.Screen
         name="ganhos/ganhos"
         options={{
           title: 'Ganhos',

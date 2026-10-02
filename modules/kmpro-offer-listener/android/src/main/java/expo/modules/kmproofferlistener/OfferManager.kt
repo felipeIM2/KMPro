@@ -203,6 +203,7 @@ object OfferManager {
     gainHourMin: Double,
     gainHourMax: Double,
     ratingMin: Double,
+    custoHora: Double,
   ) {
     val payload = JSONObject().apply {
       put("gainKmMin", gainKmMin)
@@ -210,6 +211,7 @@ object OfferManager {
       put("gainHourMin", gainHourMin)
       put("gainHourMax", gainHourMax)
       put("ratingMin", ratingMin)
+      put("custoHora", custoHora)
     }
     prefs(context).edit().putString(KEY_GOALS, payload.toString()).apply()
   }
@@ -224,6 +226,7 @@ object OfferManager {
         gainHourMin = o.optDouble("gainHourMin", 0.0),
         gainHourMax = o.optDouble("gainHourMax", 0.0),
         ratingMin = o.optDouble("ratingMin", 0.0),
+        custoHora = o.optDouble("custoHora", 0.0),
       )
     } catch (e: Exception) {
       CardGoals.DEFAULT
@@ -305,6 +308,39 @@ object OfferManager {
     if (analysis != null) {
       OfferOverlay.show(context, extended)
     }
+  }
+
+  /**
+   * Solta as ofertas pendentes de um app: a corrida dele acabou, então as
+   * assinaturas guardadas precisam ir embora junto.
+   *
+   * [seenSignatures] deriva do histórico inteiro de ofertas salvas e não tinha
+   * nenhuma forma de liberar um pacote. Efeito em campo: a corrida saía da tela e
+   * voltava com os mesmos valores (mesmo trajeto, mesmo horário) — a assinatura
+   * continuava na lista, a leitura era jogada fora como repetida e o cartão do
+   * KMPro não aparecia. É a segunda das duas camadas que travavam o acionamento;
+   * a primeira é o dedup do serviço, limpo em [RideLifecycle].
+   *
+   * O RN não precisa de evento: `use-offer-listener` guarda só a última oferta,
+   * não uma lista, então nada fica dessincronizado do lado do app.
+   */
+  fun dropOffersFor(context: Context, packageName: String) {
+    if (packageName.isBlank()) return
+    val offers = loadOffers(context)
+    if (offers.length() == 0) return
+    val kept = JSONArray()
+    var removed = 0
+    for (i in 0 until offers.length()) {
+      val item = offers.optJSONObject(i)
+      if (item != null && item.optString("packageName") == packageName) {
+        removed += 1
+      } else if (item != null) {
+        kept.put(item)
+      }
+    }
+    if (removed == 0) return
+    prefs(context).edit().putString(KEY_OFFERS, kept.toString()).apply()
+    Log.d(TAG, "[KMPro][Ride] ofertas pendentes soltas pkg=$packageName removidas=$removed")
   }
 
   /** Same offer (fare|distance|duration) must not be persisted or re-emitted. */
